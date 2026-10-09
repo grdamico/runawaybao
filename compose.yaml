@@ -1,0 +1,29 @@
+
+services:
+  openbao:
+    image: openbao/openbao:2.7.1
+    container_name: openbao
+    cap_add:
+      - IPC_LOCK
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: dev-only-token
+    command:
+      - server
+      - -dev
+      - -dev-listen-address=0.0.0.0:8200
+      - -dev-root-token-id=dev-only-token
+    ports:
+      - "127.0.0.1:8200:8200"
+    restart: unless-stopped
+
+  tetragon:
+    image: quay.io/cilium/tetragon:v1.7.0
+    container_name: tetragon
+    privileged: true
+    pid: host
+    cgroup: host
+    volumes:
+      - /sys/kernel:/sys/kernel:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /var/run:/var/run
+    restart: unless-stopped
