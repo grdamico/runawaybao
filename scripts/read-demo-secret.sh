@@ -1,13 +1,7 @@
-
 #!/usr/bin/env bash
-set -euo pipefail
+source "$(dirname "$0")/common.sh"
 
-cd "$(dirname "$0")/.."
-set -a
-source .env
-set +a
-
-curl --silent --show-error --fail \
+curl --silent --show-error --fail --connect-timeout 5 --max-time 15 \
   --header "X-Vault-Token: ${BAO_TOKEN}" \
   "${BAO_ADDR}/v1/secret/data/demo"
 

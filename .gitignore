@@ -1,3 +1,21 @@
+# Local configuration and machine-specific state
 .env
-*.log
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
 .DS_Store
+
+# Generated Go binaries, test output, and coverage
+/mock-runner
+/bin/
+/coverage/
+*.test
+*.out
+*.log
+
+# Editor temporary files
+*.swp
+*.swo
+*~

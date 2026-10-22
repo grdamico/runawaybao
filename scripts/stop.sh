@@ -1,6 +1,3 @@
-cat > scripts/stop.sh <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-docker compose down
-EOF
+source "$(dirname "$0")/common.sh"
+dc down

@@ -1,15 +1,9 @@
-
 #!/usr/bin/env bash
-set -euo pipefail
-
-cd "$(dirname "$0")/.."
-set -a
-source .env
-set +a
+source "$(dirname "$0")/common.sh"
 
 bao_json='{"data":{"username":"lab-user","password":"not-a-real-password"}}'
 
-curl --silent --show-error --fail \
+curl --silent --show-error --fail --connect-timeout 5 --max-time 15 \
   --header "X-Vault-Token: ${BAO_TOKEN}" \
   --header "Content-Type: application/json" \
   --request POST \
