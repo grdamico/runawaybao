@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grdamico/runawaybao/jobrunner"
 	"github.com/grdamico/runawaybao/openbao"
 )
 
@@ -150,6 +151,15 @@ func TestLiveACL(t *testing.T) {
 		t.Fatal("restricted Go client read failed")
 	}
 	t.Log("PASS: existing Go client read the expected dummy fixture")
+	runner := jobrunner.NewRunnerWithReader(jobrunner.NewPolicy(jobrunner.PermissionReadDemo), client)
+	if result := runner.RunContext(context.Background(), jobrunner.Job{ID: "live-read", Action: jobrunner.ActionReadDemo}); result.Status != jobrunner.Succeeded {
+		t.Fatal("authorized runner secret read failed")
+	}
+	denied := jobrunner.NewRunnerWithReader(jobrunner.NewPolicy(), client)
+	if result := denied.RunContext(context.Background(), jobrunner.Job{ID: "denied-read", Action: jobrunner.ActionReadDemo}); result.Status != jobrunner.Denied {
+		t.Fatal("runner authorization failed")
+	}
+	t.Log("PASS: runner integrated with restricted client; application authorization enforced")
 	expect("POST", "secret/data/demo", token, map[string]any{"data": map[string]string{"username": "denied-write", "password": "dummy-only"}}, 403)
 	t.Log("PASS: restricted update rejected with HTTP 403")
 	expect("GET", otherPath, token, nil, 403)

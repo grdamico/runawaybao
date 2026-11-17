@@ -1,4 +1,4 @@
-// Package openbao reads only the development demo secret from OpenBao KV v2.
+// Package openbao provides restricted fixed-path KV and database lease clients.
 package openbao
 
 import (
@@ -27,8 +27,9 @@ var (
 	ErrResponse         = errors.New("invalid OpenBao demo response")
 )
 
-// Config must be supplied explicitly. Token must be a restricted read-only
-// token, never a development root token. The client cannot infer token ACLs.
+// Config must be supplied explicitly with a restricted token, never a development
+// root token. NewClient needs demo-read access; database issuance and revocation
+// clients need their separate scoped policies. Clients cannot infer token ACLs.
 type Config struct {
 	Address string
 	Token   string

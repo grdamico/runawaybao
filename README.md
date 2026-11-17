@@ -1,230 +1,403 @@
 # RunawayBao
 
-**Jobs run. Secrets shouldn't.**
+**Temporary credentials, isolated workloads, and runtime events linked by job identity.**
 
-RunawayBao is a development security lab exploring how jobs can access narrowly
-scoped secrets while their runtime behavior remains observable. It currently
-provides three independently tested components: a mock Go job runner, a fixed-path
-OpenBao client, and a Docker Compose lab with OpenBao and Tetragon.
+RunawayBao is an experimental Go-based runtime security and credential-management
+prototype built with OpenBao, PostgreSQL, Docker, and Tetragon's eBPF process
+observability. It associates individual jobs with short-lived database credentials
+and correlates observed process executions with the correct job and credential lease.
 
-The goal is to connect authorization, secret access, runtime observation, and
-audit records incrementally. Those components are **not yet an integrated job
-execution system**.
+Three milestones have been demonstrated against live local services: authorized
+job execution and restricted KV access, independent PostgreSQL credentials with
+selective revocation, and read-only Tetragon event correlation.
 
-## Current architecture
+**Runtime threat detection, security policy decisions, and event-driven credential
+revocation are planned.** Today, PostgreSQL queries execute in the Go controller;
+a separate, secret-free Docker workload phase supplies the monitored processes.
+
+## Why RunawayBao?
+
+Secrets managers control credential issuance, lifetime, and revocation. Runtime
+security tools observe what processes do. Connecting these capabilities requires
+more than identifying an unexpected executable: a response must target the
+credential belonging to the affected workload.
+
+RunawayBao investigates that connection through an explicit mapping:
+
+```text
+Tetragon event → verified Docker workload identity → job ID → OpenBao lease
+```
+
+Incorrect attribution could revoke an unrelated job's access. The prototype
+therefore establishes credential isolation and conservative event correlation
+before adding security decisions or automated responses. A correlated execution
+is an attribution result, not evidence of malicious behavior.
+
+## Architecture
+
+The live test harness coordinates the components below. The boundaries describe
+logical responsibilities; the trusted harness is not an operating-system sandbox.
 
 ```mermaid
-flowchart LR
-    Example[Go mock-runner example] --> Runner[jobrunner package]
-    Runner --> Policy[In-memory permission policy]
-    Runner --> Result[Structured job results]
-    ACL[Opt-in live ACL test] --> Client[openbao Go client]
-    ACL -->|Setup and cleanup only| Bao[OpenBao development server]
-    Client -->|Restricted token: read demo only| Bao
-    Workload[Temporary Alpine workload] -->|Host process execution| Tetragon[Tetragon agent]
-    Tetragon --> Listener[tetra event listener]
+flowchart TB
+    subgraph Bootstrap["Trusted bootstrap authority"]
+        Setup["Configure policies, database engine, and database roles"]
+    end
+
+    subgraph Controller["Trusted Go controller / test harness"]
+        Runner["Go Job Runner"]
+        Manager["Database Job Manager"]
+        Registry["Private job / lease / workload registry"]
+        Workloads["Docker Workload Manager"]
+        Operator["Explicit lifecycle operations"]
+        subgraph Observer["Read-only observer: no OpenBao clients or tokens"]
+            Consumer["Runtime Event Consumer"]
+            Correlator["Event Correlator"]
+        end
+    end
+
+    subgraph Services["Local lab services"]
+        Bao["OpenBao: KV and database secrets engine"]
+        PG["PostgreSQL"]
+        Docker["Trusted Docker daemon"]
+        Tetragon["Tetragon: privileged eBPF monitoring"]
+    end
+
+    Jobs["Restricted Docker workloads A / B: no credentials"]
+
+    Setup -.->|"Bootstrap only"| Bao
+    Setup -.->|"Administrator initialization"| PG
+    Runner -->|"read-demo via restricted KV client"| Bao
+    Runner -->|"Authorized db-read-demo"| Manager
+    Manager -->|"Restricted issuer token"| Bao
+    Bao -->|"Per-job credentials and lease ID"| Manager
+    Bao -->|"Dedicated management account: create/drop logins"| PG
+    Manager -->|"Fixed SELECT in controller"| PG
+    Manager --> Registry
+    Workloads -->|"Create / inspect / clean up"| Docker
+    Workloads -.->|"Harness binds full container ID"| Registry
+    Docker --> Jobs
+    Jobs -.->|"Process activity"| Tetragon
+    Tetragon -->|"Structured JSON through tetra"| Consumer
+    Consumer --> Correlator
+    Docker -->|"Fresh identity inventory"| Correlator
+    Registry -->|"Read-only metadata lookup"| Correlator
+    Operator -->|"RevokeJob: explicit request"| Manager
+    Manager -->|"Exact lease revoke: separate revoker token"| Bao
 ```
 
-The runner does not call OpenBao, launch workloads, or consume Tetragon events.
-The ACL test supplies the restricted client token; the lab's root token is used
-only by its setup/cleanup code and the manual development secret scripts.
+The database phase and monitored container phase belong to the same job record,
+but execute separately. Credentials are not injected into the Docker workloads.
+There is no event-to-revocation path. The runner is a Go library with demonstration
+entry points, not an authenticated job submission service or production scheduler.
 
-## Stack and completed milestones
+## Current capabilities
 
-| Component | Version / implementation |
+### Milestone 1 — Go Runner and OpenBao KV
+
+The [job runner](jobrunner/runner.go) validates requests, applies exact permission
+grants, and prevents duplicate IDs within a runner instance. Concurrent calls are
+safe; network operations run outside the duplicate-store mutex.
+
+| Action | Required permission | Behavior |
+|---|---|---|
+| `succeed` / `fail` | `mock:execute` | Deterministic mock outcomes; no external execution |
+| `read-demo` | `secret:read-demo` | Reads the fixed OpenBao KV v2 demo secret |
+| `db-read-demo` | `database:read-demo` | Delegates to the database job manager from Milestone 2 |
+
+Requests contain only `ID` and `Action`. Blank requests do not reserve IDs; valid
+submissions reserve their IDs even when denied or failed. Duplicate protection is
+in memory. Grants come from trusted application code; there is no authentication
+layer. Use `RunContext` for cancellable KV/database operations. Mock outcomes
+remain deterministic and do not inspect the context.
+
+The [KV client](openbao/client.go) accepts an explicitly supplied restricted token
+and reads only `/v1/secret/data/demo`. It honors cancellation and timeouts, rejects
+redirects, bounds responses, and returns sanitized errors. Job results contain
+status and fixed error messages, never returned credentials or lease IDs.
+
+### Milestone 2 — PostgreSQL dynamic credentials
+
+The [database job manager](databasejob/manager.go) obtains a separate credential
+lease for each job and retains credentials privately in memory. Its registry
+records job ID, lease ID, issue time, TTL, lifecycle state, and optional workload ID.
+
+Each database operation opens a fresh local connection, runs the fixed query
+`SELECT value FROM demo.fixture WHERE id = 1`, checks the fixture, and closes the
+connection. Jobs cannot supply SQL, database addresses, or OpenBao role names.
+The live role has a two-minute default TTL and five-minute maximum.
+
+Lease lifecycle is explicit:
+
+- Successful execution retains its lease until explicit cleanup or expiry.
+- Execution failures or post-issuance cancellation trigger bounded cleanup for
+  known leases with a fresh context. Cleanup failures are reported separately.
+- `RevokeJob` resolves the job's stored lease and submits synchronous exact-lease
+  revocation. Confirmed repeats are no-ops; failed attempts remain retryable.
+- Only a synchronous OpenBao HTTP 204 marks a lease revoked and clears its stored
+  credentials. An elapsed TTL alone is not confirmation.
+- `Close` rejects new execution and attempts remaining lease cleanup. Callers must
+  cancel and join active operations first, inspect failures, and retry as needed.
+
+The [live database test](databasejob/live_integration_test.go) demonstrates that
+revoking A prevents fresh authentication with A's original credentials while B
+continues to read with its original credentials.
+
+### Milestone 3 — Tetragon runtime correlation
+
+The [workload manager](workload/docker.go) creates restricted Alpine containers.
+The trusted harness binds each full Docker ID to its job before start, then
+activates the binding using Docker's exact start timestamp. Workload bindings
+are unique and immutable. The controlled workload command launches a shell and
+its child process; the database query still runs in the controller.
+
+The [event consumer](runtimeevents/consumer.go) supervises JSON output from the
+installed `tetra getevents` CLI. It handles cancellation, malformed/oversized
+frames, reconnects, and observation gaps. Unknown event types are counted rather
+than interpreted as process execution events. Raw arguments and environment data
+are discarded rather than logged.
+
+The [correlator](runtimeevents/correlator.go) attributes an execution only when its
+container identity resolves unambiguously against trusted metadata:
+
+- This Docker/WSL environment emits a **31-character `process.docker` prefix**.
+  The implementation supports that format and full 64-character IDs; supplied
+  full container metadata must agree with the prefix.
+- Potential matches require a fresh complete Docker inventory, including unrelated
+  stopped containers, plus retained bindings for collision checks.
+- Missing, conflicting, ambiguous, unknown, or unverifiable identities remain
+  `uncorrelated`. Executable names, labels, and PIDs alone never identify a job.
+- A child's own container identity is required. Parent identity cannot fill in a
+  missing child identity. Execution IDs support deduplication without confusing
+  PID reuse with a new execution.
+- Restart counts or changed start timestamps invalidate the container generation.
+  Execution timestamps must fall within its known lifetime. Delayed and
+  out-of-order events can be marked late; retired history expires after two minutes.
+
+The observer receives a read-only metadata lookup, not an OpenBao client, revoker,
+manager instance, or token. It reports attribution and coverage gaps without
+threat classification or enforcement.
+
+## Security model
+
+### Privilege separation
+
+Bootstrap and normal job access use different credentials. The test harness
+provisions narrowly scoped tokens without the default policy; application clients
+cannot infer an opaque token's privileges, so correct configuration remains a
+trusted setup responsibility.
+
+| Credential / role | Authority |
 |---|---|
-| Go | 1.22 or newer; standard library only |
-| Docker Compose | Plugin v2 or newer |
-| OpenBao | `openbao/openbao:2.7.1`, KV v2, development mode |
-| Tetragon | `quay.io/cilium/tetragon:v1.7.0`, privileged host observation |
-| Test workload | `alpine:3.22` |
+| OpenBao development root token | Test setup, inspection, teardown, and optional manual dummy-secret scripts |
+| PostgreSQL administrator | Container initialization |
+| PostgreSQL management account | OpenBao plugin access; non-superuser with `CREATEROLE` and authority to grant the reader group |
+| KV reader token | Read only `secret/data/demo` |
+| Database issuer token | Read only the configured `<mount>/creds/reader` endpoint |
+| Database revoker token | Update only exact lease paths beneath the dedicated role; only `sync=true` is permitted in the request body |
+| Generated database login | Connect, use the demo schema, and select the fixture table |
+| Runtime observer | Read-only event and identity metadata; no OpenBao credentials or revocation interface |
 
-| Milestone | Completed behavior |
-|---|---|
-| 1 | Project-scoped lifecycle scripts, OpenBao health and dummy-secret checks, Tetragon process observation |
-| 2 | Deterministic mock job runner, structured results, unit tests |
-| 2.1 | Internal action permissions, authorization ordering, concurrency-safe duplicate detection |
-| 3.1 | Standalone Go client for the fixed OpenBao demo path |
-| 3.2 | Live restricted-token read, independent OpenBao ACL denials, token revocation and fixture cleanup |
+The revoker policy excludes body lease-ID overrides, prefix/force revocation,
+and token-revocation endpoints. The runtime correlation harness creates no
+revoker policy or token. Its credentials expire naturally before bootstrap teardown.
+See the [OpenBao database API](https://openbao.org/docs/api/secret/databases/)
+and [lease API](https://openbao.org/docs/api/system/leases/).
 
-Milestone 1 was verified on Docker Desktop with Ubuntu/WSL2 and Linux
-6.6.87.2. The live ACL test also passed on that development host. Fresh-clone
-reproducibility on another host has not been verified.
+### Database and workload boundaries
 
-## Installation
+[PostgreSQL initialization](postgres/init.sh) removes public connection, temporary
+object, and schema privileges in the demo database. Dynamic logins inherit the
+reader group, own no objects, and cannot write, create schema objects, create
+roles, or read the restricted fixture table.
 
-For the Go examples and offline tests, install Go 1.22 or newer. No Docker,
-OpenBao, `.env`, or third-party Go modules are required for those tests.
+Observation containers run as UID/GID 65534 with no network, no capabilities,
+no host binds or host namespaces, a read-only root filesystem, and
+`no-new-privileges`. Limits are 64 MiB memory, 0.25 CPU, 32 PIDs, and a 16 MiB
+`noexec,nosuid` temporary filesystem. The Alpine version tag resolves to an
+immutable local image ID before creation. Workloads receive no Docker socket,
+OpenBao tokens, or database passwords.
 
-For the live lab, also provide:
+The controller and Docker daemon are trusted. Docker access grants extensive
+host authority; the observer's read-only behavior is a code boundary, not an
+OS-enforced restriction on Docker privileges. Tetragon separately runs privileged
+with host PID/cgroup namespaces and kernel/BPF/runtime mounts. Compose project
+isolation does not isolate its host-wide instrumentation.
 
-- Docker Engine or Docker Desktop, with the Compose plugin. `docker info` must
-  succeed as your user; Docker daemon access grants extensive host privileges.
-- Bash, `curl`, and standard Linux utilities including `grep` and `sleep`.
-- A compatible Linux Docker host with eBPF/BTF support and accessible
-  `/sys/kernel`, `/sys/fs/bpf`, and `/var/run` mounts. Tetragon uses privileged
-  mode and host PID/cgroup namespaces.
+### Attribution and sensitive data
 
-On Docker Desktop, observation concerns the Linux VM's kernel and processes,
-not processes outside that VM. Other kernels and backends require validation.
+Fail-closed correlation means **refusing uncertain attribution**, not blocking
+workload execution or revoking access. Prefix resolution depends on trusted
+Docker inventory and retained history; it is not full-identity proof.
+
+Application errors and job results omit credentials, connection strings, and raw
+sensitive diagnostics. Observer output also omits lease IDs and raw event payloads.
+Use non-sensitive job IDs: they are echoed in results. Keep registry metadata,
+configuration structs, and returned credentials out of ordinary logs. Go strings
+cannot be reliably erased from memory.
+
+## Getting started
+
+### Prerequisites
+
+- Go 1.22 or newer; the PostgreSQL client uses `pgx/v5`. Initial module downloads
+  require network access. Offline tests need no Docker or `.env`, but open local
+  HTTP fixture sockets. The race detector requires a supported Go/CGO environment.
+- Docker Engine or Docker Desktop with Compose v2, accessible as your user.
+- Bash, `curl`, and standard Linux utilities for the scripts.
+- For Tetragon: a compatible Linux Docker host with eBPF/BTF support and the
+  kernel, BPF, and runtime mounts used in [compose.yaml](compose.yaml).
+
+On Docker Desktop/WSL2, enable integration for the WSL distribution and run from
+that distribution. Tetragon observes the Docker Linux VM's processes, not Windows
+processes. Other host/kernel combinations require validation.
+
+### Configure and start the lab
+
+From the repository root:
 
 ```bash
-git clone https://github.com/grdamico/runawaybao.git
-cd runawaybao
-```
-
-## Docker Compose lab
-
-Create trusted local configuration; never use real credentials:
-
-```bash
-cp .env.example .env
+go version
+docker info
+test -f .env || cp .env.example .env
 chmod 600 .env
 ./scripts/start.sh
 ./scripts/status.sh
+docker compose -p runawaybao -f compose.yaml ps
 ```
 
-`.env.example` contains a development-only placeholder. `BAO_TOKEN` configures
-the development root token; `BAO_PORT` defaults to 8200. Choose an unused port
-such as 18200 if needed. The API binds only to `127.0.0.1`. `.env` is ignored by
-Git and must never be force-added. The shell scripts source it as trusted code.
+[.env.example](.env.example) contains disposable development placeholders. Use only
+fake data in this lab. `.env` is ignored by Git; never force-add it. Scripts source
+it as trusted shell code.
 
-Scripts explicitly select project `runawaybao` and this repository's Compose
-file. Reserve that project name for one lab; multiple clones share it. Startup
-polls readiness up to 30 times. Status returns nonzero for unavailable or unhealthy
-services and probes the project's containers rather than an unrelated listener.
+| Variable | Purpose / default |
+|---|---|
+| `BAO_TOKEN` | Bootstrap development root token; not a normal job token |
+| `BAO_PORT` | OpenBao loopback host port; defaults to `8200` |
+| `POSTGRES_PORT` | PostgreSQL loopback host port; defaults to `15432` |
+| `POSTGRES_PASSWORD` | Disposable PostgreSQL administrator bootstrap password |
+| `DB_MANAGER_PASSWORD` | Disposable OpenBao database management-account password |
 
-### Manual dummy-secret checks
+Change conflicting ports in `.env`; the verified lab used OpenBao port `18200`.
+Do not stop unrelated containers to free a port. Scripts pin Compose project
+`runawaybao` and the repository's configuration file. Reserve that project name
+for one lab; separate clones share the same name.
+
+`start.sh` creates/starts all three services and polls readiness. PostgreSQL's
+init script creates its schema and roles on initialization. Starting services
+alone does not configure the OpenBao database engine: each live test creates its
+own temporary engine mount, connection, roles, and policies.
+
+### Run the demonstrations
 
 ```bash
-./scripts/put-demo-secret.sh
-./scripts/read-demo-secret.sh
+# Fixed JSON examples: success, denial, simulated failure, unknown action.
+go run ./cmd/mock-runner
+
+# Live restricted KV access and ACL checks; requires the lab already running.
+./scripts/test-openbao-acl.sh
+
+# Live per-job PostgreSQL credentials and explicit selective lease revocation.
+./scripts/test-database.sh
+
+# Live Docker/Tetragon correlation; does not request job lease revocation.
+./scripts/test-runtime-correlation.sh
 ```
 
-These development scripts use the setup/root token to write and read the fixed
-fake fixture at `secret/demo`. The read script prints the dummy response: never
-replace its fixture with real secrets. The Go application client instead requires
-a restricted token, as described below.
+Run live suites sequentially against the disposable lab, with shell tracing off.
+The database script starts OpenBao/PostgreSQL if needed. The runtime script starts
+all services and pulls `alpine:3.22`. Both configure temporary OpenBao resources.
+The runtime test launches A, B, and an owned but unregistered container, waits for
+observations, interrupts/reconnects the stream, verifies continued database access,
+and removes its containers. Natural credential/token expiry makes it take about
+two minutes; event delivery can be delayed on this host.
 
-### Tetragon process observation
+Optional manual tools are also available:
 
-In one terminal:
+| Tool | Purpose / resource effects |
+|---|---|
+| `scripts/put-demo-secret.sh` | Uses the bootstrap token to write the fixed dummy KV fixture |
+| `scripts/read-demo-secret.sh` | Uses the bootstrap token and prints the dummy response; never use with real secret data |
+| `scripts/test-process.sh` | Compact, text-filtered manual event viewer; not the structured correlation consumer |
+| `cmd/observe-jobs` | Attaches the observer to existing trusted bindings; does not provision jobs or credentials |
+
+The standalone observer accepts a private JSON array with `job_id`, `workload_id`
+(full Docker ID), `lease_id`, and `started_at` (exact Docker `StartedAt`) fields.
+A trusted coordinator must supply these records. Keep the file mode `0600` and
+outside version control. With a valid file already prepared:
 
 ```bash
-./scripts/test-process.sh
+go run ./cmd/observe-jobs /path/to/private-bindings.json
 ```
 
-In another:
+It verifies container generations before attaching and prints correlation status,
+reason, job ID, late-event indicator, and observation generation. It omits lease
+IDs and raw event payloads. The complete two-phase orchestration currently lives
+in the integration harness, not this CLI.
 
-```bash
-docker run --rm --name runawaybao-observation alpine:3.22 sh -c 'sleep 10'
-```
+### Cleanup and troubleshooting
 
-Keep the listener running for at least 40 seconds after launching the workload;
-event delivery was delayed on the verified host. Look for the corresponding
-shell/sleep events, then press `Ctrl+C`. The listener disables Compose stdin
-attachment so `tetra` connects to the agent instead of reading JSON from stdin.
-Tetragon can observe other host workloads; Compose isolation does not isolate
-kernel instrumentation or make the displayed events an audit trail.
-
-### Shutdown and restart
+Successful live suites remove their temporary mounts/policies and fixture data
+as applicable. The database suite explicitly cleans up leases and test tokens;
+the runtime suite waits for natural expiry before removing configuration. The
+workload manager removes only recorded container IDs with its random ownership
+label. Services remain running after tests.
 
 ```bash
 ./scripts/stop.sh
-./scripts/start.sh
-./scripts/status.sh
 ```
 
-Shutdown removes this project's containers and network without deleting volumes.
-**OpenBao development storage is in memory: stopping its process loses secrets,
-policies, and issued tokens.** Recreate the dummy secret after restart. Successful
-restart does not demonstrate secret persistence.
+This removes the `runawaybao` Compose containers and network. PostgreSQL uses
+tmpfs; stopping its container loses its data and generated logins. Stopping
+OpenBao's dev server loses secrets, tokens, policies, and lease records. After
+state loss, recreate the disposable lab and rerun setup/tests.
 
-### Troubleshooting
+Forced termination or connectivity loss can prevent cleanup. Inspect only this
+project's test-owned resources before recovery; do not use broad Docker pruning.
+Changing initialization SQL or bootstrap passwords requires fresh PostgreSQL
+initialization.
 
-- **Port conflict:** change `BAO_PORT` in `.env`; do not stop unrelated containers.
-- **Docker permission denied:** check daemon access and Docker Desktop WSL
-  integration before running the scripts.
-- **Readiness failure:** inspect `docker compose -p runawaybao logs tetragon`
-  and, privately, `docker compose -p runawaybao logs openbao`. OpenBao logs can
-  disclose the development root token; never publish them unredacted.
-- **Another Tetragon instance:** a PID-file guard may prevent startup. Use a
-  dedicated host or coordinate an owner-approved shutdown of that instance.
-  Never delete or bypass a live PID file.
-- **Missing events:** verify kernel/BTF compatibility and Docker-host mounts,
-  use the provided listener, and allow the delivery delay. A healthy API or
-  running container alone does not prove process observation works.
+If startup fails, first check Docker access, WSL integration, port conflicts, and
+kernel/mount compatibility. Health checks do not prove event delivery; run the
+live correlation test. Inspect OpenBao logs privately: development startup logs
+can expose the root token. Never publish unredacted logs or resolved Compose
+configuration. If another Tetragon instance owns the host instrumentation,
+coordinate its shutdown rather than bypassing its PID-file guard.
 
-## Mock job runner
+## Live verification
 
-```bash
-go run ./cmd/mock-runner
-```
+Live validation completed on **2026-11-17** using Docker Desktop 29.7.2, OpenBao
+2.7.1, PostgreSQL 17.12, and Tetragon 1.7.0 in the local WSL laboratory. These are
+observed test results, not production guarantees or benchmarks.
 
-The example prints JSON results for success, denial, simulated failure, and an
-unknown action. Inspect each result's status; the program's exit code concerns
-writing the example output.
+| Area | Verified behavior | Validation |
+|---|---|---|
+| Runner | Authorization, duplicate handling, cancellation, and safe failure results | Unit / HTTP fixture / race tests |
+| OpenBao KV | Restricted reads succeed; updates and reads of another existing key receive 403; revoked token is rejected | Live `TestLiveACL` |
+| PostgreSQL | A/B receive distinct usernames and lease IDs; both perform the fixed read | Live `TestLiveDatabase` |
+| Database authorization | Writes, restricted-table reads, DDL, and role creation are denied | Live `TestLiveDatabase` |
+| Revocation | Exact revocation of A rejects fresh authentication; B remains functional; repeats and expiry are handled | Live `TestLiveDatabase` |
+| Tetragon | Structured execution events from restricted containers are received | Live source and runtime tests |
+| Correlation | A/B shells and controlled children map to their own containers, jobs, and leases | Live `TestLiveRuntime` |
+| Unknown events | Unregistered-container and unrelated events remain uncorrelated | Live `TestLiveRuntime` |
+| Stream interruptions | Gap recorded, reconnection succeeds, and subsequent A execution correlates | Live `TestLiveRuntime` |
+| Credential preservation | Both original database credentials still read after observation | Live `TestLiveRuntime` |
+| Cleanup | Owned containers removed; leases expire; post-test inspections found no temporary test mounts, policies, or generated roles | Live suites and cleanup inspection |
 
-Import `github.com/grdamico/runawaybao/jobrunner`:
+Ambiguous/conflicting identities, PID reuse, restart invalidation, duplicates,
+out-of-order events, and processing limits are covered by unit tests. Those
+synthetic cases are not claimed as live fault-injection results. Standalone
+source tests also verified reader cleanup; the restricted lifecycle test verified
+create/start/child execution/stop/remove.
 
-```go
-runner := jobrunner.NewRunner(jobrunner.NewPolicy(jobrunner.PermissionExecute))
-result := runner.Run(jobrunner.Job{ID: "example-1", Action: "succeed"})
-```
+Full parent-graph reconstruction remains unverified; child attribution uses its
+own verified container identity. Fresh-clone portability to other hosts and the
+standalone observer CLI's complete workflow have not been established by these
+live suites.
 
-Jobs contain only `ID` and `Action`. Internal metadata requires `mock:execute`
-for both `succeed` and `fail`. Unknown actions fail before authorization; missing
-grants produce `denied`. Results contain `job_id`, `status` (`succeeded`, `failed`,
-or `denied`), and an optional error string suitable for future audit logging.
+## Testing
 
-IDs and actions are exact, case-sensitive strings and cannot be blank.
-Structurally invalid requests do not consume IDs. Every valid submission consumes
-its ID, including unknown actions, denials, successes, and simulated failures.
-Reusing an ID returns a duplicate error. A single mutex serializes submissions
-and prevents concurrent duplicate execution. ID history is in-memory and grows
-for each runner's lifetime; do not copy a runner.
-
-Policies come from trusted application code. There is no authentication layer.
-Standard JSON decoding ignores unknown request fields; such fields cannot
-change internal action permissions. No mock action starts a process or reads a
-secret.
-
-## OpenBao Go client
-
-Import `github.com/grdamico/runawaybao/openbao` and supply configuration explicitly:
-
-```go
-client, err := openbao.NewClient(openbao.Config{
-    Address: address,
-    Token: restrictedToken,
-})
-if err != nil {
-    return err
-}
-secret, err := client.ReadDemo(ctx)
-// Handle err and use secret in memory; never print or log either credential.
-```
-
-The client reads only `/v1/secret/data/demo`, parsing nonempty `username` and
-`password` strings from KV v2's `data.data`. It does not load `.env`, provision
-tokens, or fall back to root. Supply a token restricted to read-only access on
-that path, not the lab's `BAO_TOKEN`.
-
-Requests have a five-second default timeout, configurable via `Config.Timeout`,
-and honor context cancellation. Redirects are rejected and responses are limited
-to 64 KiB. Configuration accepts an HTTP(S) origin without userinfo, base paths,
-queries, or fragments. Use HTTP only on trusted local development loopback;
-use HTTPS over untrusted networks.
-
-Errors exclude tokens, secret contents, URLs, response bodies, and transport
-diagnostics. Use `errors.Is` with `ErrConfiguration`, `ErrPermissionDenied`,
-`ErrNotFound`, `ErrHTTP`, `ErrRequest`, `ErrTimeout`, or `ErrResponse`. Caller
-cancellation/deadlines return the context error. Never log configuration or
-returned secret structs. The client cannot infer an opaque token's ACLs.
-
-## Tests
-
-Offline tests use the standard `testing` package and `httptest.Server`:
+Run from the repository root:
 
 ```bash
 go test ./...
@@ -233,76 +406,127 @@ go vet ./...
 go vet -tags=integration ./...
 ```
 
-They cover runner outcomes, ID consumption and concurrency, policy decisions,
-JSON results, HTTP authentication, KV v2 parsing, errors, timeouts, cancellation,
-and redirect handling. Local loopback sockets are needed for `httptest`.
+These checks passed during milestone verification. Tests use Go's standard
+`testing` package, local HTTP fixtures, and injected dependencies. They cover
+request authorization, credential-client behavior, isolated lease state, cleanup
+failures/retries, cancellation, identity resolution, process deduplication, and
+bounded stream processing.
 
-### Live OpenBao ACL test
-
-With the development lab running and `.env` configured:
+The live suites require Docker, the local services, `.env`, and disposable data:
 
 ```bash
 ./scripts/test-openbao-acl.sh
+./scripts/test-database.sh
+./scripts/test-runtime-correlation.sh
 ```
 
-This opt-in suite uses root only for setup, inspection, and cleanup. It creates
-a uniquely named policy containing exactly:
-
-```hcl
-path "secret/data/demo" {
-  capabilities = ["read"]
-}
-```
-
-It issues a nonrenewable, five-minute token with `no_default_policy=true`, checks
-that its effective policies exclude `default`, `root`, and identity policies,
-and supplies only that restricted token to the Go client. Credentials stay in
-process memory/environment and are never written to tracked files or printed.
-
-The suite verifies an authorized read, HTTP 403 for updating the demo, and HTTP
-403 for reading another existing dummy path. It revokes the issued token,
-checks rejection afterward, and removes its unique policy and fixtures. Existing
-demo data is preserved and must match the known dummy fixture; an absent demo
-is created only if metadata is also absent, and removed during cleanup.
-
-The equivalent invocation, after supplying setup values privately, is:
+The scripts enable the `integration` build tag and the corresponding explicit
+opt-in variables. Compiling or running tagged tests alone does not enable them:
 
 ```bash
-# Set RUNAWAYBAO_ACL_ADDR and RUNAWAYBAO_ACL_ROOT_TOKEN privately first.
-RUNAWAYBAO_ACL_INTEGRATION=1 go test -tags=integration ./openbao \
-  -run '^TestLiveACL$' -count=1 -v
+go test -tags=integration ./...
 ```
 
-The test is excluded without the build tag and skips without explicit opt-in.
-Run only against disposable loopback development OpenBao, never production.
-Do not enable shell tracing or run concurrent live tests against one server.
-Cleanup failures fail the suite; forced termination or connectivity loss may
-leave fixtures/policies behind. The token TTL limits credential lifetime if
-revocation cannot finish. See [OpenBao token creation](https://openbao.org/docs/commands/token/create/)
-and [ACL policies](https://openbao.org/docs/concepts/policies/).
+Without opt-in, live tests **skip**. A skipped suite is not live verification.
 
-## Security and limitations
+For focused, credential-free diagnostics after the lab is running and
+`alpine:3.22` is available locally:
 
-- **Development only:** OpenBao dev mode, a known placeholder root token, and
-  privileged Tetragon are unsuitable for production. Use dummy data only.
-- **Independent enforcement:** application policy checks do not replace OpenBao
-  ACLs. The live suite verifies a small ACL matrix, not complete security.
-- **No integrated execution:** the runner, secret client, and observer remain
-  separate. There is no real job execution, event correlation, persistent audit
-  sink, persistent duplicate store, or enforcement response.
-- **Credential handling:** keep `.env` private and never publish tokens, secret
-  values, or unredacted logs. Go strings cannot be reliably erased from memory.
-- **Client scope:** no retries, renewal, caching, or general secret-path API.
-- **Host assumptions:** kernel capabilities and mount behavior vary. A pass on
-  the verified WSL2 host does not establish portability to another host.
+```bash
+RUNAWAYBAO_TETRA_SOURCE_INTEGRATION=1 go test -tags=integration ./runtimeevents -run '^TestLive' -count=1 -v
+RUNAWAYBAO_WORKLOAD_INTEGRATION=1 go test -tags=integration ./workload -run '^TestLiveLifecycle$' -count=1 -v
+```
+
+These opt-ins observe Tetragon and/or create restricted test-owned containers;
+they do not provision OpenBao credentials. See the source tests for timeouts and
+cleanup behavior.
+
+## Reliability and limitations
+
+- **Volatile state:** job IDs, credentials, leases, and bindings are tracked in
+  memory. There is no durable audit store, restart recovery, or reconciliation.
+  Runner/manager history grows for the instance lifetime.
+- **Lease lifecycle:** no automatic renewal or application-level issuance retry. A lost issuance
+  response may leave an unknown lease until expiry. After OpenBao dev-mode state
+  loss, acknowledging an absent lease cannot prove PostgreSQL cleanup.
+- **Authentication versus sessions:** revocation and password expiry are tested
+  against fresh authentication. Existing PostgreSQL sessions are not necessarily
+  terminated; this client closes its own connection after each operation.
+- **Observation gaps:** reconnects do not replay historical Tetragon events. Queue
+  overflow, malformed frames, reported source loss, and interruptions record gaps;
+  silent upstream loss may still occur. No event is not proof of no activity.
+- **Bounded correlation:** limits include 1 MiB frames, 256 queued notices, 64 recent
+  gap records, 64 bindings, 4096 deduplication entries, and 256 containers per
+  inventory. Deduplication/retired history lasts two minutes. Capacity exhaustion
+  refuses admission/attribution; eviction limits historical coverage.
+- **Prefix identity:** uniqueness depends on current Docker inventory and retained
+  bindings, not a complete history of unrelated removed containers. An adversarial
+  Docker administrator is outside the trust model. Stronger identity assurance
+  is needed before using these results as an enforcement foundation.
+- **Lineage and clocks:** immediate parent metadata was incomplete in this
+  environment. Lifecycle checks use `process.start_time`, not event envelope time
+  or WSL receipt time. Startup events before binding activation stay uncorrelated.
+- **Stream lifecycle:** a remote 180-second reader timeout bounds orphan lifetime
+  after connectivity failures and introduces periodic reconnect gaps in longer
+  sessions. Context cancellation reaps the local reader.
+- **Execution scope:** database work stays in the controller. Containers perform
+  a fixed observation command; there is no arbitrary workload API, production
+  scheduling, persistence, retries, or authenticated submission endpoint.
+- **Response scope:** no threat detection, dry-run policy evaluation, or automatic
+  event-driven revocation. Explicit revocation and ordinary failure cleanup exist
+  independently of the observer.
+- **Local development only:** OpenBao dev mode, placeholder bootstrap credentials,
+  privileged monitoring, and plaintext local database connections are unsuitable
+  for production. The PostgreSQL client accepts loopback IP addresses only.
+
+For Tetragon's supported event interfaces, see its
+[events documentation](https://tetragon.io/docs/concepts/events/).
 
 ## Roadmap
 
-1. Connect an authorized runner action to the restricted OpenBao client.
-2. Add workload identity and carefully scoped real execution.
-3. Correlate Tetragon events with individual jobs.
-4. Persist audit records for authorization, secret access, and execution outcomes.
-5. Explore deterministic policy tests and scoped responses to violations.
+| Milestone | Status | Scope |
+|---|---|---|
+| 1 — Runner and OpenBao KV | Completed | Authorized actions, duplicate prevention, restricted KV reads |
+| 2 — PostgreSQL credentials | Completed | Per-job dynamic credentials, lease isolation, explicit selective revocation |
+| 3 — Runtime correlation | Completed | Restricted Docker phase, structured Tetragon ingestion, read-only workload attribution |
+| 4 — Policy evaluation | Planned | Explicit security policies and dry-run decisions, with uncertainty handling |
+| 5 — Controlled response | Planned | Carefully scoped event-driven credential revocation after correlation/policy validation |
+| Future — Monitored database worker | Planned | Move database operations into observed workloads through a safe credential channel |
+| Future — Operational durability | Planned | Durable state, recovery, audit records, and stronger operational controls |
+
+## Project structure
+
+```text
+.
+├── cmd/
+│   ├── mock-runner/main.go              # Fixed mock demonstration
+│   └── observe-jobs/main.go             # Observer for private controller bindings
+├── jobrunner/                          # Validation, authorization, dispatch, duplicate IDs
+├── openbao/                            # Restricted KV, credential issuance, exact revocation
+├── databasejob/                        # Credentials, lease registry, fixed PostgreSQL read
+│   ├── live_integration_test.go         # Live bootstrap and database isolation scenario
+│   └── runtime_integration_test.go      # Two-phase job/runtime correlation scenario
+├── workload/                           # Restricted Docker lifecycle and metadata inspection
+├── runtimeevents/                      # JSON ingestion, gaps, conservative correlation
+├── postgres/init.sh                    # Demo schema and database role bootstrap
+├── scripts/
+│   ├── common.sh                       # Trusted environment and explicit Compose scope
+│   ├── start.sh / status.sh / stop.sh   # Lab lifecycle and health probes
+│   ├── test-openbao-acl.sh              # Live restricted KV scenario
+│   ├── test-database.sh                 # Live credential isolation and revocation
+│   ├── test-runtime-correlation.sh      # Live read-only observation scenario
+│   ├── test-process.sh                 # Manual text-filtered Tetragon viewer
+│   └── put-demo-secret.sh / read-demo-secret.sh
+├── compose.yaml                        # OpenBao, PostgreSQL, Tetragon
+├── .env.example                        # Disposable local bootstrap configuration
+├── go.mod / go.sum                     # Go module and dependency checksums
+└── LICENSE
+```
+
+Package directories include unit tests; live tests are guarded by the
+`integration` build tag and explicit opt-in. Small interfaces separate issuance,
+revocation, database reads, and metadata lookup so each boundary can be tested
+without coupling observation to enforcement.
 
 ## License
 

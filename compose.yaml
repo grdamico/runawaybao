@@ -23,3 +23,26 @@ services:
       - /sys/fs/bpf:/sys/fs/bpf
       - /var/run:/var/run
     restart: unless-stopped
+
+  postgres:
+    image: postgres:17.12-bookworm
+    command: ["postgres", "-c", "log_statement=none", "-c", "log_min_error_statement=panic", "-c", "log_parameter_max_length_on_error=0"]
+    tmpfs:
+      - /var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: runawaybao_admin
+      POSTGRES_DB: runawaybao
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-runawaybao-admin-dev-only}
+      RUNAWAYBAO_DB_MANAGER_PASSWORD: ${DB_MANAGER_PASSWORD:-runawaybao-manager-dev-only}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-runawaybao.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U runawaybao_admin -d runawaybao"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
