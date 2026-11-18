@@ -27,56 +27,68 @@ logical responsibilities; the trusted harness is not an operating-system sandbox
 
 ```mermaid
 flowchart TB
-    subgraph Bootstrap["Trusted bootstrap authority"]
-        Setup["Configure policies, database engine, and database roles"]
+    Setup["Trusted bootstrap: database engine, roles and restricted issuer"]
+    subgraph Controller["Trusted controller / live harness"]
+        Runner["Authorized Go Job Runner"]
+        Coordinator["containerjob.Executor"]
+        Manager["databasejob.Manager: prepare and one-shot delivery"]
+        Registry["Immutable job / container / lease mapping"]
+        Workloads["Docker lifecycle and retained ownership journal"]
+        Admission["Bind validated immutable policy before worker release"]
     end
-
-    subgraph Controller["Trusted Go controller / test harness"]
-        Runner["Go Job Runner"]
-        Manager["Database Job Manager"]
-        Registry["Private job / lease / workload registry"]
-        Workloads["Docker Workload Manager"]
-        Operator["Explicit lifecycle operations"]
-        subgraph Observer["Read-only observer: no OpenBao clients or tokens"]
-            Consumer["Runtime Event Consumer"]
-            Correlator["Event Correlator"]
-        end
+    subgraph Observer["Read-only observation and dry-run evaluation"]
+        Consumer["Structured Tetragon JSON consumer"]
+        Correlator["Conservative identity and lifecycle correlation"]
+        Adapter["policyaudit: immutable bindings and sanitized inputs"]
+        Policy["Pure executionpolicy evaluator"]
+        Audit["Sanitized decisions and gap coverage"]
     end
-
-    subgraph Services["Local lab services"]
-        Bao["OpenBao: KV and database secrets engine"]
-        PG["PostgreSQL"]
-        Docker["Trusted Docker daemon"]
-        Tetragon["Tetragon: privileged eBPF monitoring"]
+    Bao["OpenBao database secrets engine"]
+    PG["Shared PostgreSQL: member of both job networks"]
+    Docker["Trusted Docker daemon"]
+    Tetragon["Privileged Tetragon monitor"]
+    subgraph NetA["Owned internal IPv4-only isolated network A"]
+        A["A: bootstrap gate, re-exec, fixed pgx read"]
     end
-
-    Jobs["Restricted Docker workloads A / B: no credentials"]
-
-    Setup -.->|"Bootstrap only"| Bao
-    Setup -.->|"Administrator initialization"| PG
-    Runner -->|"read-demo via restricted KV client"| Bao
-    Runner -->|"Authorized db-read-demo"| Manager
-    Manager -->|"Restricted issuer token"| Bao
-    Bao -->|"Per-job credentials and lease ID"| Manager
-    Bao -->|"Dedicated management account: create/drop logins"| PG
-    Manager -->|"Fixed SELECT in controller"| PG
+    subgraph NetB["Owned internal IPv4-only isolated network B"]
+        B["B: bootstrap gate, re-exec, fixed pgx read"]
+    end
+    Legacy["Separate legacy KV and explicit revocation demonstrations"]
+    Setup -.-> Bao
+    Setup -.-> PG
+    Runner --> Coordinator
+    Coordinator --> Manager
+    Coordinator --> Workloads
+    Coordinator --> Admission
+    Manager -->|"Restricted issuance"| Bao
+    Bao -->|"Private credentials and lease ID"| Manager
+    Bao -->|"Dedicated database management account"| PG
     Manager --> Registry
-    Workloads -->|"Create / inspect / clean up"| Docker
-    Workloads -.->|"Harness binds full container ID"| Registry
-    Docker --> Jobs
-    Jobs -.->|"Process activity"| Tetragon
-    Tetragon -->|"Structured JSON through tetra"| Consumer
+    Workloads -->|"Create, inspect and owned cleanup"| Docker
+    Workloads -->|"Bind full container ID"| Registry
+    Admission -->|"Immutable policy binding"| Adapter
+    Manager -->|"Bounded attached stdin after identity and policy binding"| A
+    Manager -->|"Bounded attached stdin after identity and policy binding"| B
+    Docker --> A
+    Docker --> B
+    A -->|"Fixed SELECT"| PG
+    B -->|"Fixed SELECT"| PG
+    A -.->|"Process execution"| Tetragon
+    B -.->|"Process execution"| Tetragon
+    Tetragon -->|"tetra JSON stream"| Consumer
     Consumer --> Correlator
-    Docker -->|"Fresh identity inventory"| Correlator
+    Docker -->|"Fresh complete identity inventory"| Correlator
     Registry -->|"Read-only metadata lookup"| Correlator
-    Operator -->|"RevokeJob: explicit request"| Manager
-    Manager -->|"Exact lease revoke: separate revoker token"| Bao
+    Correlator --> Adapter
+    Adapter --> Policy
+    Policy --> Audit
+    Legacy -->|"Separate restricted clients"| Bao
 ```
 
-The database phase and monitored container phase belong to the same job record,
-but execute separately. Credentials are not injected into the Docker workloads.
-There is no event-to-revocation path. The runner is a Go library with demonstration
-entry points, not an authenticated job submission service or production scheduler.
+Milestone 5 unifies database execution and monitoring in the same container.
+Milestones 2–4 retain their original controller-query demonstrations for regression.
+There is no event-to-revocation path. The runner remains a library with laboratory
+entry points, not an authenticated submission service or scheduler.
 
 ## Current capabilities
 
@@ -90,7 +102,7 @@ safe; network operations run outside the duplicate-store mutex.
 |---|---|---|
 | `succeed` / `fail` | `mock:execute` | Deterministic mock outcomes; no external execution |
 | `read-demo` | `secret:read-demo` | Reads the fixed OpenBao KV v2 demo secret |
-| `db-read-demo` | `database:read-demo` | Delegates to the database job manager from Milestone 2 |
+| `db-read-demo` | `database:read-demo` | Delegates to the configured controller or container database executor |
 
 Requests contain only `ID` and `Action`. Blank requests do not reserve IDs; valid
 submissions reserve their IDs even when denied or failed. Duplicate protection is
@@ -109,12 +121,13 @@ The [database job manager](../databasejob/manager.go) obtains a separate credent
 lease for each job and retains credentials privately in memory. Its registry
 records job ID, lease ID, issue time, TTL, lifecycle state, and optional workload ID.
 
-Each database operation opens a fresh local connection, runs the fixed query
+In the retained Milestone 2 path, each database operation opens a fresh local connection, runs the fixed query
 `SELECT value FROM demo.fixture WHERE id = 1`, checks the fixture, and closes the
 connection. Jobs cannot supply SQL, database addresses, or OpenBao role names.
 The live role has a two-minute default TTL and five-minute maximum.
 
-Lease lifecycle is explicit:
+The legacy controller-query lease lifecycle is explicit (Milestone 5 uses the
+separate preparation/delivery lifecycle below):
 
 - Successful execution retains its lease until explicit cleanup or expiry.
 - Execution failures or post-issuance cancellation trigger bounded cleanup for
@@ -136,7 +149,8 @@ The [workload manager](../workload/docker.go) creates restricted Alpine containe
 The trusted harness binds each full Docker ID to its job before start, then
 activates the binding using Docker's exact start timestamp. Workload bindings
 are unique and immutable. The controlled workload command launches a shell and
-its child process; the database query still runs in the controller.
+its child process; in this retained Milestone 3 scenario the query runs in the
+controller. Milestone 5 instead observes the actual database worker.
 
 The [event consumer](../runtimeevents/consumer.go) supervises JSON output from the
 installed `tetra getevents` CLI. It handles cancellation, malformed/oversized
@@ -178,6 +192,84 @@ active out-of-order records are distinguished, and coverage counters remain visi
 when gap notifications are dropped. See the [policy model](policy.md) for outcomes,
 path validation, immutable bindings, and the explicit dry-run CLI.
 
+## Milestone 5 — Containerized database workloads
+
+The explicit `container-database` demo selects `containerjob.Executor` through the
+existing `jobrunner.DatabaseExecutor` interface. The mock runner, KV client,
+legacy manager execution and correlation-only CLI keep their existing behavior.
+No new runtime dependencies or services are added.
+
+1. Establish the structured Tetragon stream before job admission.
+2. Authorize the existing fixed `db-read-demo` action. `Manager.Prepare` reserves
+   the job and issues its private credential without making a database connection.
+3. Reserve unique resource names and create an owned internal bridge. Require
+   `gateway_mode_ipv4=isolated`, disable IPv6, and attach PostgreSQL as `postgres`.
+4. Create the worker from an immutable local image ID with attached stdin and the
+   existing UID, capability, filesystem, PID, CPU and memory restrictions.
+5. Bind the full Docker ID immutably to the job/lease and validated policy version.
+6. Start the bootstrap process; inspect the exact Docker generation and activate
+   correlation. The bootstrap blocks for a single release byte; it has no database
+   credentials and performs no database operation.
+7. Send the gate byte then one strict JSON credential frame on the same attached,
+   non-TTY stdin. The bootstrap reads exactly one byte without buffering and
+   re-execs `/runawaybao-db-worker worker` with an empty environment. No Docker
+   environment, argument, bind mount or temporary credential file is used.
+8. The worker accepts only `read`, `demo-child`, and `finish`. `read` opens a fresh
+   pgx connection to fixed `postgres:5432/runawaybao`, executes the fixture SELECT,
+   and retains the session for private server-side origin inspection. A repeat
+   closes the old session and authenticates again with the original credential.
+9. Evaluate correlated events in dry-run mode. No decision enters the executor.
+10. Normal `finish`, controller cancellation, and owned-resource cleanup are explicit
+    lifecycle actions. The live harness waits for natural credential/token expiry
+    before deleting its temporary bootstrap configuration. No revoker is created.
+
+The new live role uses a three-minute default TTL (five-minute maximum); legacy
+roles retain their two-minute default.
+
+The scratch image builds the worker with the existing pgx driver. Its separate
+fixed harmless child and credential-free network probe are laboratory diagnostics;
+they accept no SQL, credentials, endpoints from job input, tokens, or lease IDs.
+
+### Framing, bounds and partial outcomes
+
+Frames are newline-delimited JSON, at most 16 KiB, with unknown/duplicate fields,
+invalid UTF-8, trailing objects and incomplete frames rejected. Credential fields
+are bounded (256-byte username, 4096-byte password). Responses contain only a
+fixed status and optional backend PID. Each controller protocol exchange has a
+10-second maximum deadline and serializes access to its stream. A protocol error
+or cancellation closes and permanently taints the stream; credential delivery is
+never automatically retried. Bootstrap waits at most 90 seconds and the worker
+process lives at most 180 seconds, including blocked stdin.
+
+`Manager.Deliver` records `not_delivered`, `delivering`, `delivered`, or `uncertain`
+without holding its mutex during I/O. Issuance failures retain returned lease
+metadata. Uncertain delivery cannot be resent. TTL estimates do not mark a lease
+revoked. `NewForWorkloads` has neither a controller query reader nor a revoker.
+
+`workload.Database` reserves names before Docker mutations and retains job,
+container name/ID, network name/ID, PostgreSQL ID and phase even after errors or
+successful cleanup. Cleanup reconciles exact names and IDs, verifies the random
+ownership label, removes only its container, refuses foreign network members,
+detaches only the expected PostgreSQL container and removes its network. Failed
+cleanup retains a retryable journal. Per-job lifecycle admission rejects overlap;
+callers must cancel and join active operations before retrying cleanup. No global
+mutex spans network or Docker I/O. Journals are bounded to 32 executions per
+coordinator; they are not durable crash recovery.
+
+New code lives in `containerjob/`, `workload/database.go`, `internal/dboperation/`,
+`internal/workerprotocol/`, `cmd/db-worker/`, `cmd/demo-child/`, `cmd/network-probe/`,
+and `worker/Dockerfile`. The opt-in live coordinator is
+`databasejob/container_integration_test.go`; its script is
+`scripts/test-container-database.sh`.
+
+## Milestone status and next phase
+
+Milestones 1–5 are completed and live-verified. **Milestone 6 — controlled
+enforcement — remains planned and unimplemented.** Current observations and
+`would_revoke_lease` audit strings invoke no revocation or workload-stop action.
+A future enforcement milestone requires a separate approved design; current
+identity uncertainty, coverage gaps and lifecycle limits still apply.
+
 ## Project structure
 
 ```text
@@ -186,12 +278,21 @@ path validation, immutable bindings, and the explicit dry-run CLI.
 ├── docs/                               # Architecture, security, testing, demo guides
 ├── CONTRIBUTING.md                     # Scope and contribution checks
 ├── cmd/
+│   ├── db-worker/main.go                # Gated fixed PostgreSQL worker
+│   ├── demo-child/main.go               # Fixed harmless policy demonstration
+│   ├── network-probe/main.go            # Credential-free lab connectivity probe
 │   ├── mock-runner/main.go              # Fixed mock demonstration
 │   └── observe-jobs/main.go             # Observer for private controller bindings
 ├── jobrunner/                          # Validation, authorization, dispatch, duplicate IDs
 ├── openbao/                            # Restricted KV, credential issuance, exact revocation
+├── containerjob/                       # Admission and container database lifecycle
+├── internal/workerprotocol/            # Bounded private stdin framing
+├── internal/dboperation/               # Shared fixed pgx read
+├── worker/Dockerfile                   # Minimal scratch worker image
+├── .dockerignore                       # Source-only worker build context
 ├── databasejob/                        # Credentials, lease registry, fixed PostgreSQL read
 │   ├── live_integration_test.go         # Live bootstrap and database isolation scenario
+│   ├── container_integration_test.go   # Real container database A/B scenario
 │   └── runtime_integration_test.go      # Two-phase job/runtime correlation scenario
 ├── workload/                           # Restricted Docker lifecycle and metadata inspection
 ├── executionpolicy/                    # Pure immutable allowlists and deterministic decisions
@@ -204,6 +305,7 @@ path validation, immutable bindings, and the explicit dry-run CLI.
 │   ├── start.sh / status.sh / stop.sh   # Lab lifecycle and health probes
 │   ├── test-openbao-acl.sh              # Live restricted KV scenario
 │   ├── test-database.sh                 # Live credential isolation and revocation
+│   ├── test-container-database.sh       # Live monitored database worker scenario
 │   ├── test-runtime-policy.sh           # Live audit-only policy scenario
 │   ├── test-runtime-correlation.sh      # Live read-only observation scenario
 │   ├── test-process.sh                 # Manual text-filtered Tetragon viewer

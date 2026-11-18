@@ -134,7 +134,7 @@ func Inventory(ctx context.Context) ([]Container, error) {
 	return result, nil
 }
 func Service(ctx context.Context, name string) (string, error) {
-	if name != "tetragon" {
+	if name != "tetragon" && name != "postgres" && name != "openbao" {
 		return "", ErrDocker
 	}
 	b, e := command(ctx, "ps", "--no-trunc", "-q", "--filter", "label=com.docker.compose.project=runawaybao", "--filter", "label=com.docker.compose.service="+name)
@@ -249,7 +249,16 @@ func (d *Docker) Stop(ctx context.Context, id string) (Container, error) {
 }
 
 // Restricted checks the isolation settings without returning environment values.
-func Restricted(ctx context.Context, id string) bool {
+func Restricted(ctx context.Context, id string) bool { return restrictedOn(ctx, id, "none") }
+
+func RestrictedDatabase(ctx context.Context, id, networkID string) bool {
+	if !IDPattern.MatchString(networkID) {
+		return false
+	}
+	return restrictedOn(ctx, id, networkID)
+}
+
+func restrictedOn(ctx context.Context, id, network string) bool {
 	if !IDPattern.MatchString(id) {
 		return false
 	}
@@ -270,7 +279,7 @@ func Restricted(ctx context.Context, id string) bool {
 	if json.Unmarshal(b, &s) != nil {
 		return false
 	}
-	return s.User == "65534:65534" && !s.Privileged && s.Readonly && s.Network == "none" && s.PIDMode == "" && len(s.Binds) == 0 && s.Memory > 0 && s.Pids > 0 && len(s.Caps) == 1 && s.Caps[0] == "ALL" && len(s.Security) == 1 && s.Security[0] == "no-new-privileges:true"
+	return s.User == "65534:65534" && !s.Privileged && s.Readonly && s.Network == network && s.PIDMode == "" && len(s.Binds) == 0 && s.Memory > 0 && s.Pids > 0 && len(s.Caps) == 1 && s.Caps[0] == "ALL" && len(s.Security) == 1 && s.Security[0] == "no-new-privileges:true"
 }
 
 // SourceProcesses counts CLI readers without exposing host command arguments.

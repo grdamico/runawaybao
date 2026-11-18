@@ -1,0 +1,15 @@
+**
+!go.mod
+!go.sum
+!worker/
+!worker/Dockerfile
+!internal/
+!internal/**
+!cmd/
+!cmd/db-worker/
+!cmd/db-worker/**
+!cmd/network-probe/
+!cmd/network-probe/**
+!cmd/demo-child/
+!cmd/demo-child/**
+**/*_test.go

@@ -13,7 +13,9 @@ clearly; do not present mocked outcomes as live evidence.
 
 Changes to identity attribution, credential delivery, policy semantics, or
 revocation need an explicit design discussion. Preserve the separation between
-observation and enforcement. Never weaken identity or authorization checks to
+observation and enforcement. Milestones 1–5 are complete and dry-run runtime
+evaluation is implemented; Milestone 6 controlled enforcement remains planned.
+Never weaken identity or authorization checks to
 make a demonstration pass.
 
 ## Local checks
@@ -45,7 +47,8 @@ connection strings out of commits, issues, recordings, and logs. Do not enable
 shell tracing around bootstrap or live tests. OpenBao development logs may print
 the root token; resolved Compose configuration can also contain secrets.
 
-Use fake fixtures only. Clean up only resources owned by your test/controller;
+Use disposable fixture data only. Treat generated credentials as secrets. Clean up
+only resources owned by your test/controller;
 never prune unrelated Docker resources or bypass another agent's PID guard.
 Review terminal recordings locally before sharing them.
 
@@ -57,3 +60,12 @@ Execution policy changes must keep the evaluator pure, preserve immutable versio
 and distinguish unknown from allowed. Do not add enforcement capabilities or
 serialize raw event/correlation structures into audit output. Run the policy live
 suite when changing normalization, profile paths, or live policy wiring.
+
+For containerized database changes, run `./scripts/test-container-database.sh`
+against the disposable lab. Preserve bounded attached-stdin delivery, startup
+identity/policy binding, independent owned networks and retryable cleanup metadata.
+Keep its results separate from the legacy controller-query demonstrations. Validate
+Markdown file links and heading anchors, demo mode names, and Mermaid diagrams
+when updating documentation. Review tracked, staged and non-ignored new files
+before committing; `.env.example` is the intentional placeholder-only exception
+for environment configuration.

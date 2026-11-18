@@ -331,3 +331,74 @@ func TestImmutableWorkloadBinding(t *testing.T) {
 		t.Fatal("lease corrupted")
 	}
 }
+
+func TestWorkloadDeliveryIsOneShotAndIndependent(t *testing.T) {
+	var issued atomic.Int32
+	m, err := NewForWorkloads(issueFunc(func(context.Context) (openbao.DatabaseCredentials, error) {
+		if issued.Add(1) == 1 {
+			return fixture("lease-A"), nil
+		}
+		return fixture("lease-B"), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if m.Prepare(ctx, "A") != nil || m.Prepare(ctx, "B") != nil || m.Prepare(ctx, "A") != ErrDuplicate {
+		t.Fatal("issuance or duplicate handling")
+	}
+	sink := func(context.Context, string, string) error { return nil }
+	if m.Deliver(ctx, "A", sink) != ErrInactive {
+		t.Fatal("delivery without identity")
+	}
+	if m.BindWorkload("A", strings.Repeat("a", 64)) != nil || m.BindWorkload("B", strings.Repeat("b", 64)) != nil {
+		t.Fatal("binding")
+	}
+	if m.Deliver(ctx, "A", func(context.Context, string, string) error {
+		r, _ := m.Lookup("B")
+		if r.State != Active {
+			t.Error("registry lock or state")
+		}
+		return errors.New("sensitive-password")
+	}) != ErrRead {
+		t.Fatal("raw delivery error")
+	}
+	if m.Deliver(ctx, "A", sink) != ErrInactive || m.Deliver(ctx, "B", sink) != nil {
+		t.Fatal("uncertain resend or cross-job failure")
+	}
+	a, _ := m.Lookup("A")
+	b, _ := m.Lookup("B")
+	if a.Delivery != "uncertain" || b.Delivery != "delivered" || a.LeaseID != "lease-A" || b.LeaseID != "lease-B" {
+		t.Fatal("lost metadata")
+	}
+	if m.RevokeJob(ctx, "A") != ErrRevoke {
+		t.Fatal("unavailable revocation reported as success")
+	}
+}
+func TestWorkloadCancellationAndPartialIssuance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m, _ := NewForWorkloads(issueFunc(func(context.Context) (openbao.DatabaseCredentials, error) {
+		cancel()
+		return fixture("known-lease"), errors.New("sensitive-token")
+	}))
+	if m.Prepare(ctx, "A") != ErrIssue {
+		t.Fatal("issuance error")
+	}
+	a, _ := m.Lookup("A")
+	if a.LeaseID != "known-lease" || a.State != IssuanceFailed {
+		t.Fatal("partial issuance lost")
+	}
+	m, _ = NewForWorkloads(issueFunc(func(context.Context) (openbao.DatabaseCredentials, error) { return fixture("lease"), nil }))
+	if m.Prepare(context.Background(), "B") != nil || m.BindWorkload("B", strings.Repeat("b", 64)) != nil {
+		t.Fatal("prepare")
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	if m.Deliver(ctx, "B", func(context.Context, string, string) error { cancel(); return nil }) != ErrRead {
+		t.Fatal("cancellation ignored")
+	}
+	b, _ := m.Lookup("B")
+	if b.Delivery != "uncertain" || b.LeaseID != "lease" {
+		t.Fatal("cancel state lost")
+	}
+}

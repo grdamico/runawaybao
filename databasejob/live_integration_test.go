@@ -31,6 +31,7 @@ type capturingIssuer struct {
 	credentials         map[string]openbao.DatabaseCredentials
 	deadlines           map[string]time.Time
 	observationDeadline time.Time
+	redactionValues     []string
 }
 
 func (i *capturingIssuer) Issue(ctx context.Context) (openbao.DatabaseCredentials, error) {
@@ -55,20 +56,26 @@ func (i *capturingIssuer) get(id string) openbao.DatabaseCredentials {
 // TestLiveDatabase bootstraps only a uniquely named OpenBao mount and policies.
 // PostgreSQL schema/manager setup is performed by postgres/init.sh. No root or
 // management credential is passed into the runner, manager, or query client.
-func TestLiveDatabase(t *testing.T) { runLive(t, false, false) }
+func TestLiveContainerDatabase(t *testing.T) {
+	if os.Getenv("RUNAWAYBAO_CONTAINER_DATABASE_INTEGRATION") != "1" {
+		t.Skip("explicit container database opt-in required")
+	}
+	runLive(t, true, true, true)
+}
+func TestLiveDatabase(t *testing.T) { runLive(t, false, false, false) }
 func TestLiveRuntime(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_RUNTIME_INTEGRATION") != "1" {
 		t.Skip("explicit runtime opt-in required")
 	}
-	runLive(t, true, false)
+	runLive(t, true, false, false)
 }
 func TestLivePolicy(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_POLICY_INTEGRATION") != "1" {
 		t.Skip("explicit dry-run policy opt-in required")
 	}
-	runLive(t, true, true)
+	runLive(t, true, true, false)
 }
-func runLive(t *testing.T, observe, policy bool) {
+func runLive(t *testing.T, observe, policy, container bool) {
 	if !observe && os.Getenv("RUNAWAYBAO_DATABASE_INTEGRATION") != "1" {
 		t.Skip("explicit live database opt-in required")
 	}
@@ -140,7 +147,13 @@ func runLive(t *testing.T, observe, policy bool) {
 	roleConfig := func(ttl string) map[string]any {
 		return map[string]any{"db_name": "postgres", "creation_statements": creation, "revocation_statements": []string{`DROP ROLE IF EXISTS "{{name}}";`}, "rollback_statements": []string{`DROP ROLE IF EXISTS "{{name}}";`}, "default_ttl": ttl, "max_ttl": "5m"}
 	}
-	expect("POST", mount+"/roles/"+role, root, roleConfig("2m"), 204)
+	roleTTL := "2m"
+	observationTTL := 2 * time.Minute
+	if container {
+		roleTTL = "3m"
+		observationTTL = 3 * time.Minute
+	}
+	expect("POST", mount+"/roles/"+role, root, roleConfig(roleTTL), 204)
 	policies := map[string]string{
 		issuerPolicy:  `path "` + mount + `/creds/reader" { capabilities = ["read"] }`,
 		revokerPolicy: `path "sys/leases/revoke/` + mount + `/creds/reader/*" { capabilities = ["update"] allowed_parameters = { "sync" = [true] } }`,
@@ -164,7 +177,7 @@ func runLive(t *testing.T, observe, policy bool) {
 		}
 		tokenTTL := "15m"
 		if observe {
-			tokenTTL = "2m"
+			tokenTTL = roleTTL
 		}
 		data := expect("POST", "auth/token/create", root, map[string]any{"policies": []string{policy}, "no_default_policy": true, "ttl": tokenTTL, "renewable": false}, 200)
 		if json.Unmarshal(data, &response) != nil || response.Auth.Token == "" || response.Auth.Token == root {
@@ -195,7 +208,7 @@ func runLive(t *testing.T, observe, policy bool) {
 			t.Fatal("revoker setup failed")
 		}
 	}
-	capture := &capturingIssuer{issuer: issuer, credentials: make(map[string]openbao.DatabaseCredentials)}
+	capture := &capturingIssuer{issuer: issuer, credentials: make(map[string]openbao.DatabaseCredentials), redactionValues: []string{root, issueToken, password, os.Getenv("RUNAWAYBAO_DATABASE_ADMIN_PASSWORD")}}
 	pg, e := databasejob.NewPostgreSQL("127.0.0.1", uint16(port))
 	if e != nil {
 		t.Fatal("database client setup failed")
@@ -205,9 +218,17 @@ func runLive(t *testing.T, observe, policy bool) {
 		t.Fatal("manager setup failed")
 	}
 	if observe {
-		capture.observationDeadline = time.Now().Add(2*time.Minute + 2*time.Second)
+		capture.observationDeadline = time.Now().Add(observationTTL + 2*time.Second)
 		t.Cleanup(func() { waitObservationExpiry(t, capture, uint16(port)) })
-		runObservation(t, capture, pg, manager, policy)
+		if container {
+			manager, e = databasejob.NewForWorkloads(capture)
+			if e != nil {
+				t.Fatal("workload manager setup failed")
+			}
+			runContainerDatabase(t, capture, manager, uint16(port))
+		} else {
+			runObservation(t, capture, pg, manager, policy)
+		}
 		return
 	}
 	t.Cleanup(func() {

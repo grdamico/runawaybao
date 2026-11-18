@@ -68,6 +68,12 @@ go run ./cmd/mock-runner
 
 # Live Docker/Tetragon correlation; does not request job lease revocation.
 ./scripts/test-runtime-correlation.sh
+
+# Explicit dry-run policy evaluation using the retained controller-query scenario.
+./scripts/test-runtime-policy.sh
+
+# Real monitored PostgreSQL workers with bounded stdin delivery and owned networks.
+./scripts/test-container-database.sh
 ```
 
 Run live suites sequentially against the disposable lab, with shell tracing off.
@@ -98,8 +104,8 @@ go run ./cmd/observe-jobs /path/to/private-bindings.json
 
 It verifies container generations before attaching and prints correlation status,
 reason, job ID, late-event indicator, and observation generation. It omits lease
-IDs and raw event payloads. The complete two-phase orchestration currently lives
-in the integration harness, not this CLI.
+IDs and raw event payloads. The retained two-phase scenario and the Milestone 5 containerized coordinator
+live in integration harnesses, not this attachment-only CLI.
 
 ### Cleanup and troubleshooting
 
@@ -237,7 +243,7 @@ This opts into `TestLivePolicy` using `RUNAWAYBAO_POLICY_INTEGRATION=1`. Standar
 sets that opt-in to `0`, compiles the tagged tests without running their bodies,
 and runs policy unit/race/vet checks with the other packages. The live test uses
 only an issuer token and waits for natural expiry; it performs no policy-triggered
-revocation or termination. Database operations remain in the controller.
+revocation or termination. In this retained Milestone 4 suite, database operations run in the controller.
 
 The live A/B scenario verified exact emitted workload paths, A allowed, B shell
 suspicious, unknown events untargeted, reconnection/gap reporting, retained original
@@ -249,3 +255,118 @@ and queue-pressure cases are not claimed as live fault injection.
 
 See the [policy guide](policy.md) and [demo guide](demo.md). Existing Milestones 1–3
 live suites remain separate regression checks.
+
+## Milestone 5 containerized database verification
+
+```bash
+./scripts/test-container-database.sh
+# Same test with presentation labels:
+./scripts/demo.sh container-database
+# Optional instrumented live coordinator:
+GOFLAGS=-race ./scripts/test-container-database.sh
+```
+
+This explicitly enables `RUNAWAYBAO_CONTAINER_DATABASE_INTEGRATION=1` and runs
+`TestLiveContainerDatabase`. The script builds `worker/Dockerfile` with a narrow
+`.dockerignore` context (no `.env`, Git metadata or controller code), resolves the
+image to an immutable ID and uses the existing disposable lab. Standard CI sets
+the opt-in to `0`; tagged compilation is not live execution. Go 1.22+ is still the
+module baseline. Docker must support bridge gateway mode `isolated` (verified
+locally with Engine 29.7.2); older engines fail rather than weaken isolation.
+
+Expected live checks:
+
+- Structured event readiness precedes admission. A/B receive unique leases,
+  credentials, full container IDs, and independently owned internal networks.
+- Each pgx read originates inside its monitored container. Private administrator
+  queries match `pg_stat_activity` backend PID, username and `client_addr` to the
+  trusted Docker network address, before and after policy evaluation. Passwords,
+  connection strings and server rows are never printed.
+- Both dynamic users receive PostgreSQL permission error `42501` for a write.
+- Tetragon's exact `/runawaybao-db-worker` path is allowed for A/B. Only B launches
+  the fixed `/runawaybao-unexpected` child; its own container identity must resolve
+  to B and produce a suspicious dry-run recommendation. Parent metadata is not
+  used as a substitute for a child's container identity.
+- Unknown events remain untargeted. A deliberate reader interruption reconnects,
+  with the coverage generation preserved in periodic audit records.
+- A/B make fresh authenticated reads with their original credentials afterward.
+  No policy record can revoke credentials or terminate a worker.
+- Full Docker inspection, both worker log streams, actual raw Tetragon JSON before
+  decoding, ordinary job results and safe audit records are checked privately for
+  sensitive values. The raw scanner retains only a bounded 16 KiB suffix and a
+  match flag; no raw capture is published. Literal and JSON-escaped forms are
+  checked, not every possible transformation.
+- A deliberately nonexistent immutable image fails after network attachment and
+  credential issuance; its lease and owned-resource journal remain available.
+  Lost delivery acknowledgement is simulated after a real stdin transfer; the
+  outcome stays uncertain and cannot be resent. Cancellation and repeated cleanup
+  remove only owned resources and keep the cleanup journal.
+- Credentials and issuer token expire naturally before temporary bootstrap
+  configuration teardown. No revoker policy/token exists in this path.
+
+The test allows up to 70 seconds for delayed execution records. An initial
+35-second window missed the child event while worker/probe events were visible;
+a credential-free longer-window probe confirmed the emitted child path and
+31-character container prefix. A separate two-second child binary makes the
+laboratory execution predictable; it does not change attribution requirements.
+
+### Network evidence and limits
+
+The suite checks the internal/isolated IPv4-only network settings and restricted
+container configuration. Each bridge must contain only its worker and PostgreSQL.
+PostgreSQL TCP/5432 is reachable. Each worker starts an owned diagnostic listener
+on TCP/9099; local probes must reach it, while probes to the other worker in both
+directions must fail. Additional worker probes target OpenBao on its lab IP:8200,
+external `1.1.1.1:443`, and `host.docker.internal:18200`. Each denial counts as
+confirmed only if a control in PostgreSQL's network namespace reaches that same
+target. An unavailable control is printed as `UNCONFIRMED`, never converted to a
+passing isolation claim.
+
+These are selected TCP/IPv4 reachability observations, not proof of a universal
+firewall. Other host interfaces/services, DNS forwarding and UDP are not exhaustively
+verified. The Docker daemon, host, privileged monitor and shared PostgreSQL server
+remain trusted. The diagnostic helper receives no credentials.
+
+Unit fixtures separately test strict/oversized/duplicate frames, safe worker EOF
+and invalid operations, delivery ambiguity, cancellation, independent lease state,
+blocked session cancellation, tainted-session reuse refusal, foreign container or
+network ownership, uncertain Docker discovery, cleanup retries and admission
+serialization. A fixture CLI is not a live Docker failure test. The explicit lost
+acknowledgement injection does not simulate every daemon/network failure or a
+controller crash. Existing Milestones 1–4 suites remain separate regressions.
+
+### Recorded local results (2026-11-18)
+
+The ordinary live Milestone 5 run passed, followed by a race-instrumented live
+coordinator run (worker binaries remain the normal scratch-image builds). Both
+verified A/B origin, exact-path policy outcomes, fresh post-policy authentication,
+private credential-surface checks, failure injection, owned cleanup and natural
+expiry. The final race run additionally exercised explicit stream interruption and
+reconnection with retained gap coverage. No live test was skipped in these runs.
+
+| Network check | Observed result |
+|---|---|
+| Worker → PostgreSQL TCP/5432 | Reachable for A and B |
+| Worker A ↔ worker B TCP/9099 | Blocked in both directions; local listener controls reachable |
+| Worker → OpenBao lab IP TCP/8200 | Blocked for A/B; PostgreSQL-namespace control reachable |
+| Worker → `1.1.1.1:443` | Blocked for A/B; control reachable |
+| Worker → `host.docker.internal:18200` | Blocked for A/B; control reachable |
+| Other host services/interfaces, DNS forwarding, UDP | Not exhaustively verified |
+| Privileged host/Docker daemon access | Outside the confidentiality/isolation claim |
+
+The host port above is the tested local configuration; changing lab ports can
+make that selected control unavailable, which the suite reports as unconfirmed.
+The checks establish these selected boundaries, not complete network confinement.
+Hosted CI for this revision still requires a push; local CI-equivalent checks do
+not establish that a GitHub Actions run has executed.
+
+Milestones 1–4 were rerun successfully using `demo.sh all`,
+`test-runtime-policy.sh`, and `test-openbao-acl.sh`: selective A-only revocation,
+B continuity, SQL permission denials, natural expiry, conservative runtime
+correlation, reconnection, dry-run evaluation and restricted KV authorization
+all passed against live services. The mock CLI also retained its expected results.
+Unit tests, race tests, ordinary/tagged vet, tagged compilation, shell syntax,
+YAML parsing, local documentation file links and whitespace checks passed.
+Final health checks found all three project services healthy, no remaining
+observation-owned containers or networks, and zero `tetra` CLI readers. Services
+and the reusable local worker image were intentionally left available.

@@ -1,4 +1,4 @@
-# Runtime execution policies (Milestone 4)
+# Runtime execution policies (Milestones 4–5)
 
 [Project overview](../README.md) · [Architecture](architecture.md) · [Security model](security-model.md)
 
@@ -158,7 +158,8 @@ profile. Unknown events get no targeted recommendation. The scenario interrupts
 and reconnects observation and verifies that both original PostgreSQL credentials
 still work. Owned containers are removed as ordinary teardown; credentials and
 the issuer token expire naturally before temporary bootstrap configuration removal.
-The PostgreSQL query still runs in the controller, not the monitored container.
+In this retained Milestone 4 demonstration, PostgreSQL queries run in the
+controller. The Milestone 5 demo below runs them inside monitored containers.
 
 ## Verification and limits
 
@@ -177,3 +178,24 @@ paths, and cannot detect changed binary contents or malicious behavior inside an
 allowed executable. Shells are not inherently malicious. Existing prefix-resolution,
 lineage, volatile-state, and event-loss limits still apply. Policy bindings rely on
 trusted controller admission and remain in memory.
+
+## Milestone 5 database worker profile
+
+`containerjob.Policies()` supplies the immutable `container-reader:v1` profile for
+the new explicit containerized database demo. Its exact paths are
+`/runawaybao-db-worker` and `/runawaybao-netprobe`. The latter is a fixed,
+credential-free laboratory connectivity diagnostic. B alone runs the harmless
+`/runawaybao-unexpected` child, which is absent from the allowlist. The initial
+bootstrap can produce unstable descriptor references; those retain the existing
+unknown semantics. The gate then re-execs the worker after policy/identity binding.
+
+Both workers perform real database reads before and after evaluation. Findings
+are audit strings only: the executor has no decision input, revoker or policy-driven
+stop path. Ordinary finish/cancellation/resource teardown are separate lifecycle
+operations. The new live path constructs an issuance-only manager and waits for
+natural expiry; the older controller-query policy demo is preserved unchanged.
+
+The new profile is selected by the live coordinator, not a default change to the
+standalone observer CLI catalog. That CLI keeps its existing Milestone 4 profiles
+and correlation-only default. Attaching it to the new profile would require an
+explicit catalog addition and trusted admission bindings.

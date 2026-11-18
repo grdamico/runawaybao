@@ -5,13 +5,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-  printf 'Usage: ./scripts/demo.sh {credentials|correlation|policy|all}\n'
+  printf 'Usage: ./scripts/demo.sh {credentials|correlation|policy|container-database|all}\n'
   printf 'Requires disposable local configuration; see docs/demo.md.\n'
 }
 
 case ${1:-} in
   -h|--help) usage; exit 0 ;;
-  credentials|correlation|policy|all) mode=$1 ;;
+  credentials|correlation|policy|container-database|all) mode=$1 ;;
   *) usage >&2; exit 2 ;;
 esac
 if (($# != 1)); then usage >&2; exit 2; fi
@@ -37,6 +37,12 @@ if [[ "$mode" == policy ]]; then
   printf 'Compare explicit per-workload allowlists; no security enforcement occurs.\n'
   ./scripts/test-runtime-policy.sh
   printf 'Dry-run policy checks passed.\n'
+fi
+
+if [[ "$mode" == container-database ]]; then
+  printf '\n=== D. Containerized database workloads: dry-run only ===\n'
+  ./scripts/test-container-database.sh
+  printf 'Containerized database checks passed.\n'
 fi
 
 printf '\nSelected live demonstrations passed. Project services remain running.\n'

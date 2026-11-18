@@ -14,7 +14,7 @@ trusted setup responsibility.
 | Credential / role | Authority |
 |---|---|
 | OpenBao development root token | Test setup, inspection, teardown, and optional manual dummy-secret scripts |
-| PostgreSQL administrator | Container initialization |
+| PostgreSQL administrator | Container initialization and private test-only connection-origin inspection |
 | PostgreSQL management account | OpenBao plugin access; non-superuser with `CREATEROLE` and authority to grant the reader group |
 | KV reader token | Read only `secret/data/demo` |
 | Database issuer token | Read only the configured `<mount>/creds/reader` endpoint |
@@ -35,12 +35,13 @@ object, and schema privileges in the demo database. Dynamic logins inherit the
 reader group, own no objects, and cannot write, create schema objects, create
 roles, or read the restricted fixture table.
 
-Observation containers run as UID/GID 65534 with no network, no capabilities,
+Legacy observation containers run as UID/GID 65534 with no network, no capabilities,
 no host binds or host namespaces, a read-only root filesystem, and
 `no-new-privileges`. Limits are 64 MiB memory, 0.25 CPU, 32 PIDs, and a 16 MiB
 `noexec,nosuid` temporary filesystem. The Alpine version tag resolves to an
-immutable local image ID before creation. Workloads receive no Docker socket,
-OpenBao tokens, or database passwords.
+immutable local image ID before creation. Legacy workloads receive no Docker socket, OpenBao tokens, or database passwords.
+Milestone 5 workers receive only their own database login through attached stdin;
+they receive no Docker socket or OpenBao token.
 
 The controller and Docker daemon are trusted. Docker access grants extensive
 host authority; the observer's read-only behavior is a code boundary, not an
@@ -58,7 +59,9 @@ Application errors and job results omit credentials, connection strings, and raw
 sensitive diagnostics. Observer output also omits lease IDs and raw event payloads.
 Use non-sensitive job IDs: they are echoed in results. Keep registry metadata,
 configuration structs, and returned credentials out of ordinary logs. Go strings
-cannot be reliably erased from memory.
+cannot be reliably erased from memory. The database job manager retains expired
+credential values until its in-memory instance is discarded; TTL alone neither
+confirms cleanup nor clears credentials.
 
 ## Reliability and limitations
 
@@ -70,7 +73,8 @@ cannot be reliably erased from memory.
   loss, acknowledging an absent lease cannot prove PostgreSQL cleanup.
 - **Authentication versus sessions:** revocation and password expiry are tested
   against fresh authentication. Existing PostgreSQL sessions are not necessarily
-  terminated; this client closes its own connection after each operation.
+  terminated; the legacy client closes each connection. The new worker holds its
+  own session until the next read, finish, cancellation/EOF, or lifetime deadline.
 - **Observation gaps:** reconnects do not replay historical Tetragon events. Queue
   overflow, malformed frames, reported source loss, and interruptions record gaps;
   silent upstream loss may still occur. No event is not proof of no activity.
@@ -88,15 +92,17 @@ cannot be reliably erased from memory.
 - **Stream lifecycle:** a remote 180-second reader timeout bounds orphan lifetime
   after connectivity failures and introduces periodic reconnect gaps in longer
   sessions. Context cancellation reaps the local reader.
-- **Execution scope:** database work stays in the controller. Containers perform
-  a fixed observation command; there is no arbitrary workload API, production
+- **Execution scope:** Milestone 5 runs fixed database reads inside monitored
+  containers; legacy demonstrations retain controller reads. There is no arbitrary
+  workload API, production
   scheduling, persistence, retries, or authenticated submission endpoint.
 - **Response scope:** no general threat detection or automatic event-driven revocation.
   Exact-path policy evaluation is available only as an explicit dry-run option. Explicit revocation and ordinary failure cleanup exist
   independently of the observer.
 - **Local development only:** OpenBao dev mode, placeholder bootstrap credentials,
   privileged monitoring, and plaintext local database connections are unsuitable
-  for production. The PostgreSQL client accepts loopback IP addresses only.
+  for production. The legacy PostgreSQL wrapper accepts loopback IP addresses only; the worker
+  has a fixed internal PostgreSQL endpoint.
 
 For Tetragon's supported event interfaces, see its
 [events documentation](https://tetragon.io/docs/concepts/events/).
@@ -115,3 +121,41 @@ when event-local evaluation resumes. Descriptor references such as `/proc/self/f
 are unknown; path-only policies cannot establish their underlying binary identity.
 This deliberate uncertainty is not a safe verdict and can conceal behavior outside
 the scope of an exact-path policy. Read [policy semantics and limitations](policy.md).
+
+## Milestone 5 credential channel and networking
+
+Only the trusted coordinator handles issuer credentials, private database logins,
+and job/lease records. Workers receive neither issuer/revoker tokens nor lease IDs.
+The observer receives read-only metadata; neither it nor the pure evaluator has a
+revocation or workload termination interface. Lifecycle cleanup never consumes a
+policy decision. The new live harness creates no revoker policy or token.
+
+Attached stdin avoids persistence in Docker configuration, environment, arguments,
+files and images. Protocol errors are static. Full inspection and both worker log
+streams are checked privately, as are raw Tetragon transport bytes, ordinary job
+results and sanitized audits. This checks those actual surfaces and credential
+values, not arbitrary encodings, future sensor policies or all possible leaks.
+The trusted host, Docker daemon, controller memory and a privileged monitor can
+observe pipe traffic or workload memory. PostgreSQL traffic is plaintext in this
+local lab. There is no secure-memory-erasure guarantee.
+
+Each job owns a separate IPv4-only internal bridge with isolated gateway mode,
+containing only that worker and PostgreSQL. This requires a supporting Docker
+Engine; unsupported configurations fail rather than fall back to a regular
+internal bridge with host bridge reachability. PostgreSQL remains dual/multihomed
+on the lab network for OpenBao management, so it is a trusted shared service,
+not a network security boundary against PostgreSQL compromise.
+
+Live probes must use positive controls: PostgreSQL is reachable, peer listeners
+are locally reachable, and OpenBao/external/host targets must be reachable from
+a control namespace before their denied worker probes count as confirmed.
+An internal bridge is not a universal firewall. Tests cover selected IPv4 ports
+and host endpoints, not every host address/service, DNS forwarding/exfiltration,
+UDP or a hostile Docker administrator. See [testing](testing.md) for measured
+results; unavailable controls are reported as unconfirmed.
+
+Ownership records survive ambiguous Docker mutations and failed cleanup in memory.
+A controller crash loses these journals; time-bounded workers can exit while stopped
+containers, networks or PostgreSQL attachments remain. Operators must use retained
+exact resource IDs/names and ownership labels for manual recovery, never broad
+pruning. Lost issuance responses can still leave unknown leases until expiry.

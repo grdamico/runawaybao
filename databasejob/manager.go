@@ -55,6 +55,7 @@ type Record struct {
 	IssuedAt   time.Time
 	TTL        time.Duration
 	State      State
+	Delivery   string
 }
 type entry struct {
 	record      Record
@@ -118,7 +119,7 @@ func (m *Manager) Execute(ctx context.Context, id string) error {
 		}
 		return ErrIssue
 	}
-	if ctx.Err() != nil || m.reader.Read(ctx, credentials) != nil || ctx.Err() != nil {
+	if m.reader == nil || ctx.Err() != nil || m.reader.Read(ctx, credentials) != nil || ctx.Err() != nil {
 		if m.cleanup(e) != nil {
 			return ErrCleanup
 		}
@@ -163,7 +164,7 @@ func (m *Manager) Read(ctx context.Context, id string) error {
 	if state != Active {
 		return ErrInactive
 	}
-	if m.reader.Read(ctx, credentials) != nil || ctx.Err() != nil {
+	if m.reader == nil || m.reader.Read(ctx, credentials) != nil || ctx.Err() != nil {
 		if m.cleanup(e) != nil {
 			return ErrCleanup
 		}
@@ -189,7 +190,12 @@ func (m *Manager) revoke(ctx context.Context, e *entry) error {
 	}
 	e.record.State = Revoking
 	m.mu.Unlock()
-	err := m.revoker.Revoke(ctx, id)
+	var err error
+	if m.revoker == nil {
+		err = ErrRevoke
+	} else {
+		err = m.revoker.Revoke(ctx, id)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {
@@ -285,5 +291,78 @@ func (m *Manager) BindWorkload(jobID, workloadID string) error {
 		}
 	}
 	e.record.WorkloadID = workloadID
+	return nil
+}
+
+// NewForWorkloads enables preparation/delivery only, with no revoker or host reader.
+func NewForWorkloads(issuer Issuer) (*Manager, error) {
+	if issuer == nil {
+		return nil, ErrConfiguration
+	}
+	return &Manager{issuer: issuer, jobs: make(map[string]*entry)}, nil
+}
+
+// Prepare reserves and issues without opening PostgreSQL in the controller.
+// Unknown issuance outcomes stay recorded; no automatic revocation is attempted.
+func (m *Manager) Prepare(ctx context.Context, id string) error {
+	if !validContext(ctx) || strings.TrimSpace(id) == "" {
+		return ErrConfiguration
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
+	if _, ok := m.jobs[id]; ok {
+		m.mu.Unlock()
+		return ErrDuplicate
+	}
+	e := &entry{record: Record{JobID: id, State: Issuing}, busy: true}
+	m.jobs[id] = e
+	m.mu.Unlock()
+	defer m.release(e)
+	credentials, err := m.issuer.Issue(ctx)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e.credentials = credentials
+	e.record.LeaseID = credentials.LeaseID
+	e.record.TTL = credentials.TTL
+	e.record.IssuedAt = time.Now()
+	e.record.Delivery = "not_delivered"
+	if err != nil || ctx.Err() != nil || credentials.LeaseID == "" || credentials.Username == "" || credentials.Password == "" || credentials.TTL <= 0 {
+		e.record.State = IssuanceFailed
+		return ErrIssue
+	}
+	e.record.State = Active
+	return nil
+}
+
+// Deliver invokes one trusted sink outside the registry lock. A failed or
+// canceled attempt is ambiguous and cannot be automatically resent to a worker.
+func (m *Manager) Deliver(ctx context.Context, id string, sink func(context.Context, string, string) error) error {
+	if !validContext(ctx) || sink == nil {
+		return ErrConfiguration
+	}
+	e, err := m.acquire(id)
+	if err != nil {
+		return err
+	}
+	defer m.release(e)
+	m.mu.Lock()
+	if m.closed || e.record.State != Active || e.record.WorkloadID == "" || e.record.Delivery != "not_delivered" {
+		m.mu.Unlock()
+		return ErrInactive
+	}
+	e.record.Delivery = "delivering"
+	c := e.credentials
+	m.mu.Unlock()
+	err = sink(ctx, c.Username, c.Password)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err != nil || ctx.Err() != nil {
+		e.record.Delivery = "uncertain"
+		return ErrRead
+	}
+	e.record.Delivery = "delivered"
 	return nil
 }

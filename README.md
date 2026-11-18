@@ -19,35 +19,53 @@ findings; no response is executed.
 flowchart TB
     subgraph Controller["Trusted Go controller / test harness"]
         Runner["Authorized Job Runner"]
-        Manager["Database Job Manager"]
-        Registry["Job / lease / workload registry"]
-        Launcher["Docker Workload Manager"]
+        Coordinator["Container database coordinator"]
+        Manager["Issuance-only Database Job Manager"]
+        Registry["Immutable job / container / lease registry"]
+        Launcher["Docker lifecycle and owned cleanup journal"]
         Observer["Read-only event consumer and correlator"]
-        Policy["Pure policy evaluator: explicit dry-run option"]
-        Audit["Sanitized audit records: no enforcement"]
+        Policy["Immutable exact-path policy: dry-run only"]
+        Audit["Sanitized audit records"]
     end
-    Bao["OpenBao: restricted issuance and explicit revocation"]
-    PG["PostgreSQL"]
-    Jobs["Restricted Docker workloads A / B: no credentials"]
-    Tetragon["Tetragon: privileged eBPF monitoring"]
-    Runner --> Manager
-    Manager -->|"Issue request / explicit revoke"| Bao
+    Bao["OpenBao: restricted issuer"]
+    PG["PostgreSQL: attached to both owned networks"]
+    subgraph NetA["Owned internal isolated network A"]
+        A["Job A: startup gate and Go database worker"]
+    end
+    subgraph NetB["Owned internal isolated network B"]
+        B["Job B: startup gate and Go database worker"]
+    end
+    Tetragon["Tetragon: separate privileged monitoring"]
+    Runner --> Coordinator
+    Coordinator --> Manager
+    Coordinator --> Launcher
+    Coordinator -->|"Bind job and full container ID"| Registry
+    Coordinator -->|"Bind immutable policy before release"| Policy
+    Manager -->|"Restricted issuance"| Bao
     Bao -->|"Credentials and lease ID"| Manager
-    Manager -->|"Fixed query in controller"| PG
     Manager --> Registry
-    Launcher -->|"Harness binds verified container IDs"| Registry
-    Launcher --> Jobs
-    Jobs -.->|"Process activity"| Tetragon
+    Manager -->|"Bounded attached stdin after binding"| A
+    Manager -->|"Bounded attached stdin after binding"| B
+    Launcher --> A
+    Launcher --> B
+    A -->|"Fixed SELECT"| PG
+    B -->|"Fixed SELECT"| PG
+    A -.->|"Process activity"| Tetragon
+    B -.->|"Process activity"| Tetragon
     Tetragon -->|"Structured JSON"| Observer
+    Launcher -->|"Verified Docker inventory and lifecycle"| Observer
     Registry -->|"Read-only metadata"| Observer
     Observer --> Policy
     Policy --> Audit
 ```
 
-**Database queries currently run in the controller, not the monitored containers.**
-The container phase is secret-free. The observer verifies identities against Docker
-metadata and has no OpenBao clients, tokens, or revocation interface. Explicit lease
-revocation is a separate controller operation; no Tetragon event triggers it.
+**Milestone 5 executes the database reads inside the monitored containers.**
+A bootstrap gate delays the worker until immutable job/container/lease and policy
+bindings are established. Credentials travel only over attached, non-TTY stdin:
+strict JSON frames are capped at 16 KiB, exchanges have a 10-second deadline,
+and uncertain delivery is never automatically resent. The new
+coordinator has no revoker, and the observer and evaluator remain read-only.
+The earlier controller-query demonstrations remain available as regression tests.
 See the [full architecture](docs/architecture.md) and
 [security model](docs/security-model.md).
 
@@ -59,6 +77,7 @@ See the [full architecture](docs/architecture.md) and
 | 2 — PostgreSQL credentials | Unique per-job credentials and leases, least-privilege reads, internal registry, exact selective revocation without disrupting another job |
 | 3 — Runtime correlation | Restricted Docker workloads, structured Tetragon events, conservative container-to-job-to-lease attribution, deduplication, bounded processing, reconnect/gap reporting |
 | 4 — Dry-run policies | Immutable per-workload exact-path allowlists, deterministic allowed/suspicious/unknown outcomes, sanitized audit records, explicit gap/lifecycle handling; no enforcement |
+| 5 — Containerized database workloads | Fixed Go worker, private stdin delivery, startup gate, per-job isolated internal networks, retained cleanup journal, PostgreSQL-side query-origin checks; dry-run only |
 
 The runner is a Go library with demonstration entry points, not an authenticated
 submission service or general-purpose scheduler. Unknown or ambiguous identities
@@ -86,17 +105,18 @@ go run ./cmd/mock-runner
 Use only disposable placeholders from `.env.example`; keep `.env` private. OpenBao
 and PostgreSQL bind to loopback. Change conflicting ports in `.env` before startup.
 
-Run the two **separate** live demonstrations:
+Run the live demonstrations separately:
 
 ```bash
 ./scripts/demo.sh credentials  # Explicitly revoke A; verify B still works.
 ./scripts/demo.sh correlation  # Observe A/B; keep both credentials working.
 ./scripts/demo.sh policy       # Evaluate A/B policies; recommendations are audit-only.
+./scripts/demo.sh container-database # Real monitored database workers (Milestone 5).
 ```
 
 `./scripts/demo.sh all` retains its original credential-plus-correlation sequence.
-The new `policy` mode is selected separately. The wrapper preserves actual test
-output and exit status. The correlation test takes about two minutes because it
+The `policy` and `container-database` modes are selected separately. The wrapper
+preserves actual test output and exit status. The correlation test takes about two minutes because it
 waits for natural credential expiry before teardown. Services remain running.
 See the [demo and recording guide](docs/demo.md) for expected checkpoints and
 resource effects, and the [testing guide](docs/testing.md) for individual suites.
@@ -134,6 +154,20 @@ database credentials continued to work after evaluation. Descriptor-based startu
 records were classified as unknown rather than allowed. See the
 [policy model and limitations](docs/policy.md).
 
+Milestone 5 was live-verified on **2026-11-18**, including a race-instrumented
+controller run. PostgreSQL confirmed separate container-origin sessions before
+and after dry-run evaluation. Tetragon emitted `/runawaybao-db-worker` and
+`/runawaybao-unexpected` with the observed 31-character Docker identity prefix;
+B's child mapped only to B. Raw event, Docker inspection/log, job-result and audit
+checks found no tested credential values. Failure injection retained leases and
+ownership journals; cleanup and natural expiry passed.
+
+Selected TCP probes confirmed blocked worker-to-worker access in both directions,
+OpenBao access, external IPv4 access, and the Docker Desktop host's published
+OpenBao port, with reachable controls. DNS, UDP, other host services and privileged
+host access are outside these verified isolation claims. See the detailed
+[test evidence and limits](docs/testing.md#milestone-5-containerized-database-verification).
+
 ## Testing and CI
 
 ```bash
@@ -164,7 +198,8 @@ Docker/controller privileges and privileged Tetragon monitoring remain trust bou
 
 There is no general threat detection or event-driven revocation. Policy violations
 are dry-run findings, not proof of malicious intent.
-Database execution inside monitored containers is also planned. Read the
+The new live path requires Docker bridge `isolated` gateway mode. Network probes
+cover selected endpoints, not every host service or DNS exfiltration path. Read the
 [security model and full limitations](docs/security-model.md) before extending the lab.
 
 ## Roadmap
@@ -175,8 +210,8 @@ Database execution inside monitored containers is also planned. Read the
 | 2 — Dynamic PostgreSQL credentials and selective revocation | Completed |
 | 3 — Tetragon ingestion and workload correlation | Completed |
 | 4 — Explicit policy evaluation and dry-run decisions | Completed |
-| 5 — Carefully controlled event-driven revocation | Planned |
-| Move database work into monitored workloads through a safe credential channel | Future |
+| 5 — Containerized database workloads, dry-run only | Completed |
+| 6 — Controlled enforcement: carefully scoped event-driven revocation | Planned |
 | Durable state, recovery, audit records, and stronger operational controls | Future |
 
 ## Documentation
