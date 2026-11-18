@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go and shell checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '1'
+      # Standard CI must not opt into Docker, OpenBao, or Tetragon tests.
+      RUNAWAYBAO_ACL_INTEGRATION: '0'
+      RUNAWAYBAO_DATABASE_INTEGRATION: '0'
+      RUNAWAYBAO_RUNTIME_INTEGRATION: '0'
+      RUNAWAYBAO_TETRA_SOURCE_INTEGRATION: '0'
+      RUNAWAYBAO_WORKLOAD_INTEGRATION: '0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Unit tests
+        run: go test ./...
+      - name: Race detector
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Compile integration-tagged tests without running them
+        run: go test -tags=integration -run '^$' ./...
+      - name: Vet integration-tagged code
+        run: go vet -tags=integration ./...
+      - name: Shell syntax
+        shell: bash
+        run: |
+          for script in scripts/*.sh postgres/init.sh; do
+            bash -n "$script"
+          done
+      - name: Whitespace check
+        run: git diff --check
