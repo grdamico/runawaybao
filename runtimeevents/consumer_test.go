@@ -87,3 +87,31 @@ func TestRejectsOversizedExtractedMetadata(t *testing.T) {
 		t.Fatal("oversized extracted metadata accepted")
 	}
 }
+
+func TestDroppedGapNoticeStillVisible(t *testing.T) {
+	c := NewConsumer(nil)
+	c.mu.Lock()
+	c.observing = true
+	c.mu.Unlock()
+	old := Notice{Coverage: Coverage{Status: "observing"}}
+	for i := 0; i < cap(c.Notices); i++ {
+		c.Notices <- Notice{}
+	}
+	c.gap("queue_overflow")
+	if c.Coverage().Generation != 1 || len(c.Notices) != cap(c.Notices) {
+		t.Fatal("gap state lost with notification")
+	}
+	effective := c.EffectiveCoverage(old)
+	if effective.Generation != 1 || effective.Status != "unknown" {
+		t.Fatal("queued event crossing gap claimed coverage")
+	}
+	<-c.Notices
+	c.emit(Event{})
+	for len(c.Notices) > 1 {
+		<-c.Notices
+	}
+	n := <-c.Notices
+	if n.Coverage.Generation != 1 || n.Coverage.Status != "observing" {
+		t.Fatal("resumed event lost history")
+	}
+}

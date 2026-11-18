@@ -4,12 +4,14 @@
 
 RunawayBao is an experimental Go security prototype combining OpenBao, PostgreSQL,
 Docker, and Tetragon's eBPF observability. It demonstrates per-job database
-credentials, selective lease revocation, and read-only runtime event correlation.
+credentials, selective lease revocation, read-only runtime event correlation, and
+deterministic execution-policy evaluation in dry-run mode.
 
 Secrets management controls access; runtime monitoring observes behavior. Connecting
 them safely requires knowing **which workload owns which credential lease**. An
 incorrect attribution could revoke an unrelated job's access. RunawayBao establishes
-that mapping before introducing automated security responses.
+that mapping before introducing automated security responses. Policies can now produce audit-only
+findings; no response is executed.
 
 ## Current architecture
 
@@ -21,6 +23,8 @@ flowchart TB
         Registry["Job / lease / workload registry"]
         Launcher["Docker Workload Manager"]
         Observer["Read-only event consumer and correlator"]
+        Policy["Pure policy evaluator: explicit dry-run option"]
+        Audit["Sanitized audit records: no enforcement"]
     end
     Bao["OpenBao: restricted issuance and explicit revocation"]
     PG["PostgreSQL"]
@@ -36,6 +40,8 @@ flowchart TB
     Jobs -.->|"Process activity"| Tetragon
     Tetragon -->|"Structured JSON"| Observer
     Registry -->|"Read-only metadata"| Observer
+    Observer --> Policy
+    Policy --> Audit
 ```
 
 **Database queries currently run in the controller, not the monitored containers.**
@@ -52,6 +58,7 @@ See the [full architecture](docs/architecture.md) and
 | 1 — Runner and OpenBao KV | Authorized actions, in-memory duplicate prevention, context-aware secret operations, restricted KV reads, secret-free results |
 | 2 — PostgreSQL credentials | Unique per-job credentials and leases, least-privilege reads, internal registry, exact selective revocation without disrupting another job |
 | 3 — Runtime correlation | Restricted Docker workloads, structured Tetragon events, conservative container-to-job-to-lease attribution, deduplication, bounded processing, reconnect/gap reporting |
+| 4 — Dry-run policies | Immutable per-workload exact-path allowlists, deterministic allowed/suspicious/unknown outcomes, sanitized audit records, explicit gap/lifecycle handling; no enforcement |
 
 The runner is a Go library with demonstration entry points, not an authenticated
 submission service or general-purpose scheduler. Unknown or ambiguous identities
@@ -84,9 +91,11 @@ Run the two **separate** live demonstrations:
 ```bash
 ./scripts/demo.sh credentials  # Explicitly revoke A; verify B still works.
 ./scripts/demo.sh correlation  # Observe A/B; keep both credentials working.
+./scripts/demo.sh policy       # Evaluate A/B policies; recommendations are audit-only.
 ```
 
-Or run `./scripts/demo.sh all` sequentially. The wrapper preserves actual test
+`./scripts/demo.sh all` retains its original credential-plus-correlation sequence.
+The new `policy` mode is selected separately. The wrapper preserves actual test
 output and exit status. The correlation test takes about two minutes because it
 waits for natural credential expiry before teardown. Services remain running.
 See the [demo and recording guide](docs/demo.md) for expected checkpoints and
@@ -118,6 +127,13 @@ handling, and processing limits also have unit/fixture coverage. These synthetic
 cases are distinct from live fault-injection results. See the
 [verification matrix](docs/testing.md#live-verification).
 
+Milestone 4 was also verified live on **2026-11-18**: exact workload paths matched
+A's allowlist; B's shell produced `suspicious` with audit-only
+`would_revoke_lease`; unknown inputs remained untargeted; and both original
+database credentials continued to work after evaluation. Descriptor-based startup
+records were classified as unknown rather than allowed. See the
+[policy model and limitations](docs/policy.md).
+
 ## Testing and CI
 
 ```bash
@@ -146,7 +162,8 @@ history; parent lineage was incomplete in this environment. Revocation is verifi
 against new authentication, not termination of existing PostgreSQL sessions.
 Docker/controller privileges and privileged Tetragon monitoring remain trust boundaries.
 
-There is no threat detection, runtime policy evaluation, or event-driven revocation.
+There is no general threat detection or event-driven revocation. Policy violations
+are dry-run findings, not proof of malicious intent.
 Database execution inside monitored containers is also planned. Read the
 [security model and full limitations](docs/security-model.md) before extending the lab.
 
@@ -157,7 +174,7 @@ Database execution inside monitored containers is also planned. Read the
 | 1 — Authorized runner and restricted OpenBao KV | Completed |
 | 2 — Dynamic PostgreSQL credentials and selective revocation | Completed |
 | 3 — Tetragon ingestion and workload correlation | Completed |
-| 4 — Explicit policy evaluation and dry-run decisions | Planned |
+| 4 — Explicit policy evaluation and dry-run decisions | Completed |
 | 5 — Carefully controlled event-driven revocation | Planned |
 | Move database work into monitored workloads through a safe credential channel | Future |
 | Durable state, recovery, audit records, and stronger operational controls | Future |
@@ -168,6 +185,7 @@ Database execution inside monitored containers is also planned. Read the
 - [Security model and reliability limits](docs/security-model.md)
 - [Local setup, tests, and live verification](docs/testing.md)
 - [Demonstrations and optional terminal recording](docs/demo.md)
+- [Dry-run policy model and audit semantics](docs/policy.md)
 - [Contribution guide](CONTRIBUTING.md)
 
 ## License

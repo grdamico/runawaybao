@@ -91,8 +91,8 @@ cannot be reliably erased from memory.
 - **Execution scope:** database work stays in the controller. Containers perform
   a fixed observation command; there is no arbitrary workload API, production
   scheduling, persistence, retries, or authenticated submission endpoint.
-- **Response scope:** no threat detection, dry-run policy evaluation, or automatic
-  event-driven revocation. Explicit revocation and ordinary failure cleanup exist
+- **Response scope:** no general threat detection or automatic event-driven revocation.
+  Exact-path policy evaluation is available only as an explicit dry-run option. Explicit revocation and ordinary failure cleanup exist
   independently of the observer.
 - **Local development only:** OpenBao dev mode, placeholder bootstrap credentials,
   privileged monitoring, and plaintext local database connections are unsuitable
@@ -101,3 +101,17 @@ cannot be reliably erased from memory.
 For Tetragon's supported event interfaces, see its
 [events documentation](https://tetragon.io/docs/concepts/events/).
 
+
+## Dry-run policy boundary
+
+The evaluator is pure and receives no I/O or enforcement interfaces. The adapter
+has no OpenBao clients/tokens or Docker lifecycle object. Recommendations are
+strings in sanitized records, never executable actions. Policy versions are copied
+and bound immutably by trusted admission before a live workload starts.
+
+Uncorrelated, ambiguous, historical, incomplete, or currently unobservable inputs
+cannot produce targeted hypothetical revocations. Known past gaps remain visible
+when event-local evaluation resumes. Descriptor references such as `/proc/self/fd/6`
+are unknown; path-only policies cannot establish their underlying binary identity.
+This deliberate uncertainty is not a safe verdict and can conceal behavior outside
+the scope of an exact-path policy. Read [policy semantics and limitations](policy.md).

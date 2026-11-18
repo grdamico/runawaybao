@@ -5,13 +5,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-  printf 'Usage: ./scripts/demo.sh {credentials|correlation|all}\n'
+  printf 'Usage: ./scripts/demo.sh {credentials|correlation|policy|all}\n'
   printf 'Requires disposable local configuration; see docs/demo.md.\n'
 }
 
 case ${1:-} in
   -h|--help) usage; exit 0 ;;
-  credentials|correlation|all) mode=$1 ;;
+  credentials|correlation|policy|all) mode=$1 ;;
   *) usage >&2; exit 2 ;;
 esac
 if (($# != 1)); then usage >&2; exit 2; fi
@@ -30,6 +30,13 @@ if [[ "$mode" == correlation || "$mode" == all ]]; then
   printf 'No runtime event requests credential revocation. Cleanup waits for natural expiry.\n'
   ./scripts/test-runtime-correlation.sh
   printf 'Read-only correlation checks passed.\n'
+fi
+
+if [[ "$mode" == policy ]]; then
+  printf '\n=== C. Runtime policy evaluation: dry-run only ===\n'
+  printf 'Compare explicit per-workload allowlists; no security enforcement occurs.\n'
+  ./scripts/test-runtime-policy.sh
+  printf 'Dry-run policy checks passed.\n'
 fi
 
 printf '\nSelected live demonstrations passed. Project services remain running.\n'

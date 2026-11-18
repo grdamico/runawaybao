@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"github.com/grdamico/runawaybao/executionpolicy"
+	"github.com/grdamico/runawaybao/policyaudit"
 	"io"
 	"os"
 	"os/signal"
@@ -17,17 +20,22 @@ import (
 )
 
 type binding struct {
-	JobID      string    `json:"job_id"`
-	WorkloadID string    `json:"workload_id"`
-	LeaseID    string    `json:"lease_id"`
-	StartedAt  time.Time `json:"started_at"`
+	PolicyID      string    `json:"policy_id"`
+	PolicyVersion string    `json:"policy_version"`
+	JobID         string    `json:"job_id"`
+	WorkloadID    string    `json:"workload_id"`
+	LeaseID       string    `json:"lease_id"`
+	StartedAt     time.Time `json:"started_at"`
 }
 
 func run(ctx context.Context) error {
-	if len(os.Args) != 2 {
-		return errors.New("usage: observe-jobs PRIVATE_BINDINGS_JSON")
+	flags := flag.NewFlagSet("observe-jobs", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	dryRun := flags.Bool("dry-run", false, "emit audit-only execution policy decisions")
+	if flags.Parse(os.Args[1:]) != nil || flags.NArg() != 1 {
+		return errors.New("usage: observe-jobs [--dry-run] PRIVATE_BINDINGS_JSON")
 	}
-	f, err := os.Open(os.Args[1])
+	f, err := os.Open(flags.Arg(0))
 	if err != nil {
 		return errors.New("cannot open private binding file")
 	}
@@ -39,6 +47,18 @@ func run(ctx context.Context) error {
 	var bindings []binding
 	if json.Unmarshal(bytes, &bindings) != nil || len(bindings) == 0 || len(bindings) > 64 {
 		return errors.New("invalid binding file")
+	}
+	var policies *policyaudit.Adapter
+	if *dryRun {
+		policies, err = policyaudit.New(executionpolicy.DemoPolicies())
+		if err != nil {
+			return errors.New("invalid dry-run policies")
+		}
+		for _, b := range bindings {
+			if policies.Bind(policyaudit.Binding{JobID: b.JobID, WorkloadID: b.WorkloadID, PolicyID: b.PolicyID, PolicyVersion: b.PolicyVersion}) != nil {
+				return errors.New("invalid dry-run policy binding")
+			}
+		}
 	}
 	metadata := make(map[string]runtimeevents.Metadata)
 	for _, b := range bindings {
@@ -65,7 +85,45 @@ func run(ctx context.Context) error {
 	defer func() { cancel(); <-done }()
 	// Job IDs must be non-sensitive identifiers. Lease IDs and payloads are omitted.
 	encoder := json.NewEncoder(os.Stdout)
-	for notice := range consumer.Notices {
+	audit := policyaudit.NewWriter(os.Stdout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	previousCoverage := runtimeevents.Coverage{}
+	for {
+		var notice runtimeevents.Notice
+		select {
+		case <-ticker.C:
+			if *dryRun {
+				snapshot := consumer.Coverage()
+				if snapshot != previousCoverage {
+					if audit.Coverage(snapshot) != nil {
+						return policyaudit.ErrAudit
+					}
+					previousCoverage = snapshot
+				}
+			}
+			continue
+		case n, ok := <-consumer.Notices:
+			if !ok {
+				if *dryRun {
+					if audit.Coverage(consumer.Coverage()) != nil {
+						return policyaudit.ErrAudit
+					}
+				}
+				return nil
+			}
+			notice = n
+		}
+		if *dryRun && notice.Gap != nil {
+			if audit.Gap(*notice.Gap) != nil {
+				return policyaudit.ErrAudit
+			}
+			if audit.Coverage(consumer.Coverage()) != nil {
+				return policyaudit.ErrAudit
+			}
+			continue
+		}
+
 		if notice.Gap != nil {
 			if encoder.Encode(map[string]any{"status": "observation_gap", "reason": notice.Gap.Reason, "generation": notice.Generation}) != nil {
 				return errors.New("output failed")
@@ -83,11 +141,17 @@ func run(ctx context.Context) error {
 			stop()
 		}
 		result := corr.Resolve(*notice.Event, inventory, err == nil)
+		if *dryRun {
+			decision := policies.Evaluate(*notice.Event, result, consumer.EffectiveCoverage(notice))
+			if audit.Decision(decision) != nil {
+				return policyaudit.ErrAudit
+			}
+			continue
+		}
 		if encoder.Encode(map[string]any{"status": result.Status, "reason": result.Reason, "job_id": result.JobID, "late": result.Late, "generation": notice.Generation}) != nil {
 			return errors.New("output failed")
 		}
 	}
-	return nil
 }
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

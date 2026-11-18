@@ -17,7 +17,13 @@ type Gap struct {
 	Reason     string
 	Generation uint64
 }
+type Coverage struct {
+	Status     string
+	Generation uint64
+}
+
 type Notice struct {
+	Coverage   Coverage
 	Event      *Event
 	Gap        *Gap
 	Generation uint64
@@ -30,14 +36,15 @@ type Stats struct {
 // Consumer owns a bounded queue and bounded gap history. Run must be called once.
 // On queue overflow, counters/history preserve the loss even if notices cannot.
 type Consumer struct {
-	Notices chan Notice
-	Ready   chan struct{}
-	source  Source
-	mu      sync.Mutex
-	stats   Stats
-	active  io.ReadCloser
-	ready   sync.Once
-	backoff time.Duration
+	Notices   chan Notice
+	Ready     chan struct{}
+	source    Source
+	mu        sync.Mutex
+	stats     Stats
+	active    io.ReadCloser
+	observing bool
+	ready     sync.Once
+	backoff   time.Duration
 }
 
 func NewConsumer(source Source) *Consumer {
@@ -59,18 +66,26 @@ func (c *Consumer) gap(reason string) {
 		c.stats.Recent = c.stats.Recent[:63]
 	}
 	c.stats.Recent = append(c.stats.Recent, g)
+	snapshot := Coverage{Status: "interrupted", Generation: c.stats.Gaps}
+	if c.observing {
+		snapshot.Status = "observing"
+	}
 	c.mu.Unlock()
 	select {
-	case c.Notices <- Notice{Gap: &g, Generation: g.Generation}:
+	case c.Notices <- Notice{Gap: &g, Generation: g.Generation, Coverage: snapshot}:
 	default:
 	}
 }
 func (c *Consumer) emit(e Event) {
 	c.mu.Lock()
+	snapshot := Coverage{Status: "interrupted", Generation: c.stats.Gaps}
+	if c.observing {
+		snapshot.Status = "observing"
+	}
 	generation := c.stats.Gaps
 	c.mu.Unlock()
 	select {
-	case c.Notices <- Notice{Event: &e, Generation: generation}:
+	case c.Notices <- Notice{Event: &e, Generation: generation, Coverage: snapshot}:
 	default:
 		c.mu.Lock()
 		c.stats.Dropped++
@@ -139,6 +154,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 						c.gap("malformed_frame")
 					} else {
 						if kind == "other" || kind == "loss" || (kind == "exec" && event.Process.ExecID != "") {
+							c.mu.Lock()
+							c.observing = true
+							c.mu.Unlock()
 							c.ready.Do(func() { close(c.Ready) })
 						}
 						switch kind {
@@ -162,6 +180,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			_ = stream.Close()
 			c.mu.Lock()
 			c.active = nil
+			c.observing = false
 			c.mu.Unlock()
 		}
 		if ctx.Err() != nil {
@@ -190,4 +209,32 @@ func (c *Consumer) Interrupt() {
 	if stream != nil {
 		_ = stream.Close()
 	}
+}
+
+// Coverage returns counters even when queue pressure dropped a gap notice.
+// Source creation alone is not proof of a subscribed stream: observing becomes
+// true only after a recognized structured frame arrives on that connection.
+func (c *Consumer) Coverage() Coverage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	status := "interrupted"
+	if c.observing {
+		status = "observing"
+	}
+	return Coverage{Status: status, Generation: c.stats.Gaps}
+}
+
+// EffectiveCoverage combines the event's frozen snapshot with current counters.
+// A queued event crossing a gap cannot claim current coverage. The latest gap
+// generation remains visible even when the corresponding notification was lost.
+func (c *Consumer) EffectiveCoverage(n Notice) Coverage {
+	current := c.Coverage()
+	result := n.Coverage
+	if current.Generation != result.Generation || current.Status != "observing" {
+		result.Status = "unknown"
+	}
+	if current.Generation > result.Generation {
+		result.Generation = current.Generation
+	}
+	return result
 }

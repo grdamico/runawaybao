@@ -165,6 +165,19 @@ The observer receives a read-only metadata lookup, not an OpenBao client, revoke
 manager instance, or token. It reports attribution and coverage gaps without
 threat classification or enforcement.
 
+## Milestone 4 — Dry-run policy evaluation
+
+The optional policy path follows verified correlation. `executionpolicy` compiles
+immutable Go allowlists and evaluates normalized values without I/O or infrastructure
+dependencies. `policyaudit` binds policy versions to workload IDs, selects sanitized
+facts, and writes JSON audit output. Neither layer receives a revoker or workload
+termination interface. Correlation-only CLI behavior remains the default.
+
+Policy admission precedes workload start in the live coordinator. Terminated and
+active out-of-order records are distinguished, and coverage counters remain visible
+when gap notifications are dropped. See the [policy model](policy.md) for outcomes,
+path validation, immutable bindings, and the explicit dry-run CLI.
+
 ## Project structure
 
 ```text
@@ -181,6 +194,8 @@ threat classification or enforcement.
 │   ├── live_integration_test.go         # Live bootstrap and database isolation scenario
 │   └── runtime_integration_test.go      # Two-phase job/runtime correlation scenario
 ├── workload/                           # Restricted Docker lifecycle and metadata inspection
+├── executionpolicy/                    # Pure immutable allowlists and deterministic decisions
+├── policyaudit/                        # Read-only policy adapter and safe audit output
 ├── runtimeevents/                      # JSON ingestion, gaps, conservative correlation
 ├── postgres/init.sh                    # Demo schema and database role bootstrap
 ├── scripts/
@@ -189,6 +204,7 @@ threat classification or enforcement.
 │   ├── start.sh / status.sh / stop.sh   # Lab lifecycle and health probes
 │   ├── test-openbao-acl.sh              # Live restricted KV scenario
 │   ├── test-database.sh                 # Live credential isolation and revocation
+│   ├── test-runtime-policy.sh           # Live audit-only policy scenario
 │   ├── test-runtime-correlation.sh      # Live read-only observation scenario
 │   ├── test-process.sh                 # Manual text-filtered Tetragon viewer
 │   └── put-demo-secret.sh / read-demo-secret.sh

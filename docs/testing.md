@@ -218,11 +218,34 @@ CI runs ordinary unit tests, race tests with CGO enabled, vet, shell syntax, and
 whitespace checks. Local HTTP fixtures use loopback sockets on the hosted runner;
 no socket tests are skipped. Integration-tagged tests are compiled with
 `go test -tags=integration -run '^$' ./...` and vetted with the same tag. The empty
-test selection executes no test bodies, and all five live opt-ins are explicitly
+test selection executes no test bodies, and all live opt-ins are explicitly
 set to `0`. No repository secrets, `.env`, Docker services, privileged workloads,
 or eBPF setup are used by this workflow.
 
-The workflow needs its first hosted run after push to establish GitHub runner
-verification. Local execution of the same Go commands validates the code paths,
+The existing CI is operational; this changed revision still needs its next hosted
+run after push to establish GitHub runner verification. Local execution of the same Go commands validates the code paths,
 not GitHub's action orchestration. Live demonstrations stay opt-in outside CI;
 see the [presentation and recording guide](demo.md).
+
+## Milestone 4 policy verification
+
+```bash
+./scripts/test-runtime-policy.sh
+```
+
+This opts into `TestLivePolicy` using `RUNAWAYBAO_POLICY_INTEGRATION=1`. Standard CI
+sets that opt-in to `0`, compiles the tagged tests without running their bodies,
+and runs policy unit/race/vet checks with the other packages. The live test uses
+only an issuer token and waits for natural expiry; it performs no policy-triggered
+revocation or termination. Database operations remain in the controller.
+
+The live A/B scenario verified exact emitted workload paths, A allowed, B shell
+suspicious, unknown events untargeted, reconnection/gap reporting, retained original
+PostgreSQL access, and secret-free audit JSON. Unit tests cover missing/invalid or
+conflicting policies, immutable versions, deterministic output, correlation
+uncertainty, duplicate/out-of-order/historical events, dropped gap notices, unsafe
+metadata, audit failures, and the default CLI's compatibility. Synthetic ambiguity
+and queue-pressure cases are not claimed as live fault injection.
+
+See the [policy guide](policy.md) and [demo guide](demo.md). Existing Milestones 1–3
+live suites remain separate regression checks.

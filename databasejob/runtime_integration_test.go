@@ -3,8 +3,14 @@
 package databasejob_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/grdamico/runawaybao/executionpolicy"
+	"github.com/grdamico/runawaybao/policyaudit"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -28,13 +34,24 @@ func (forbiddenRevoker) Revoke(context.Context, string) error {
 }
 
 type observed struct {
+	decision   *executionpolicy.Decision
 	event      runtimeevents.Event
 	result     runtimeevents.Result
 	generation uint64
 }
 
-func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.PostgreSQL, manager *databasejob.Manager) {
+func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.PostgreSQL, manager *databasejob.Manager, dryRun bool) {
 	t.Helper()
+	var policies *policyaudit.Adapter
+	if dryRun {
+		var err error
+		policies, err = policyaudit.New(executionpolicy.DemoPolicies())
+		if err != nil {
+			t.Fatal("invalid policy configuration")
+		}
+	}
+	var auditBytes auditBuffer
+	audit := policyaudit.NewWriter(&auditBytes)
 	ctx, cancel := context.WithTimeout(context.Background(), 170*time.Second)
 	defer cancel()
 	service, err := workload.Service(ctx, "tetragon")
@@ -53,8 +70,41 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 	go func() {
 		defer close(resolved)
 		defer close(results)
-		for notice := range consumer.Notices {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		previous := runtimeevents.Coverage{}
+		for {
+			var notice runtimeevents.Notice
+			select {
+			case <-ticker.C:
+				if dryRun {
+					snapshot := consumer.Coverage()
+					if snapshot != previous {
+						if audit.Coverage(snapshot) != nil {
+							t.Error("audit sink failed")
+							return
+						}
+						previous = snapshot
+					}
+				}
+				continue
+			case n, ok := <-consumer.Notices:
+				if !ok {
+					return
+				}
+				notice = n
+			}
 			if notice.Event == nil {
+				if dryRun && notice.Gap != nil {
+					if audit.Gap(*notice.Gap) != nil {
+						t.Error("audit sink failed")
+						return
+					}
+					if audit.Coverage(consumer.Coverage()) != nil {
+						t.Error("audit sink failed")
+						return
+					}
+				}
 				continue
 			}
 			var inventory []workload.Container
@@ -65,8 +115,17 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 				stop()
 			}
 			r := corr.Resolve(*notice.Event, inventory, err == nil)
+			var decision *executionpolicy.Decision
+			if dryRun {
+				d := policies.Evaluate(*notice.Event, r, consumer.EffectiveCoverage(notice))
+				decision = &d
+				if audit.Decision(d) != nil {
+					t.Error("audit sink failed")
+					return
+				}
+			}
 			select {
-			case results <- observed{*notice.Event, r, notice.Generation}:
+			case results <- observed{event: *notice.Event, result: r, generation: notice.Generation, decision: decision}:
 			case <-ctx.Done():
 				return
 			}
@@ -83,6 +142,11 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 		case <-resolved:
 		case <-time.After(6 * time.Second):
 			t.Error("resolver did not stop")
+			return
+		}
+		if dryRun {
+			validatePolicyAudit(t, auditBytes.snapshot(), capture)
+			t.Log("PASS: dry-run audit JSON excludes credentials, lease IDs, process payloads, and connection strings")
 		}
 	}()
 	select {
@@ -132,6 +196,15 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 				t.Fatal("workload binding failed")
 			}
 		}
+		if dryRun && job != "unknown" {
+			profile := "demo-shell"
+			if job == "B" {
+				profile = "demo-no-shell"
+			}
+			if policies.Bind(policyaudit.Binding{JobID: job, WorkloadID: container.ID, PolicyID: profile, PolicyVersion: "v1"}) != nil {
+				t.Fatal("policy binding rejected before workload start")
+			}
+		}
 		info, err := docker.Start(ctx, container.ID)
 		if err != nil {
 			t.Fatal("workload start failed")
@@ -157,8 +230,10 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 	parents := map[string]map[string]bool{"A": {}, "B": {}}
 	children := map[string][]string{"A": {}, "B": {}}
 	unknown := false
+	allowedA, suspiciousB := false, false
+	paths := map[string]bool{}
 	verified := func() bool {
-		return len(parents["A"]) > 0 && len(children["A"]) > 0 && len(parents["B"]) > 0 && len(children["B"]) > 0 && unknown
+		return len(parents["A"]) > 0 && len(children["A"]) > 0 && len(parents["B"]) > 0 && len(children["B"]) > 0 && unknown && (!dryRun || (allowedA && suspiciousB && paths["/usr/bin/tail"] && paths["/bin/sh"] && paths["/bin/sleep"]))
 	}
 
 	reasons := map[string]int{}
@@ -171,6 +246,9 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 			if o.event.Process.Docker == id[:31] || o.event.Process.Docker == id {
 				expected = job
 			}
+		}
+		if dryRun && (expected == "unknown" || expected == "") && o.decision != nil && o.decision.Recommendation != "" {
+			t.Fatal("unknown event produced targeted hypothetical revocation")
 		}
 		if expected == "unknown" {
 			if o.result.Status == "correlated" {
@@ -189,6 +267,31 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 			record, _ := manager.Lookup(expected)
 			if o.result.LeaseID != record.LeaseID || o.result.ContainerID != ids[expected] {
 				t.Fatal("wrong job-to-lease mapping")
+			}
+			if dryRun {
+				d := o.decision
+				if d == nil || d.JobID != expected || d.WorkloadID != ids[expected] || d.PolicyVersion != "v1" {
+					t.Fatal("policy decision crossed workload boundary")
+				}
+				paths[o.event.Process.Binary] = true
+				if d.Coverage.Status == "observing" && !d.Terminated {
+					if expected == "A" && d.Reason == "unstable_executable_reference" {
+						if d.Outcome != executionpolicy.Unknown || d.Recommendation != "" {
+							t.Fatal("unstable descriptor path treated as reliable executable identity")
+						}
+					} else if expected == "A" {
+						if d.Outcome != executionpolicy.Allowed || d.PolicyID != "demo-shell" {
+							t.Fatalf("controlled A execution rejected: path=%q outcome=%s reason=%s policy=%s", o.event.Process.Binary, d.Outcome, d.Reason, d.PolicyID)
+						}
+						allowedA = true
+					}
+					if expected == "B" && o.event.Process.Binary == "/bin/sh" {
+						if d.Outcome != executionpolicy.Suspicious || d.PolicyID != "demo-no-shell" || d.Recommendation != "would_revoke_lease" {
+							t.Fatal("B policy violation missing")
+						}
+						suspiciousB = true
+					}
+				}
 			}
 			if strings.HasSuffix(o.event.Process.Binary, "/sh") {
 				parents[expected][o.event.Process.ExecID] = true
@@ -214,6 +317,10 @@ func runObservation(t *testing.T, capture *capturingIssuer, pg *databasejob.Post
 		}
 	}
 	t.Log("PASS: A/B shell and controlled child executions map independently to their own container, job, and lease; unrelated events remain uncorrelated")
+	if dryRun {
+		t.Log("PASS: exact Tetragon paths /usr/bin/tail, /bin/sh, /bin/sleep verified; A allowed; B shell suspicious with audit-only would_revoke_lease")
+	}
+
 	previous := consumer.Stats().Connections
 	consumer.Interrupt()
 	resume := time.NewTimer(45 * time.Second)
@@ -326,4 +433,65 @@ func waitObservationExpiry(t *testing.T, capture *capturingIssuer, port uint16) 
 		}
 	}
 	t.Log("PASS: observation credentials expired naturally before temporary mount/policy teardown")
+}
+
+// The bounded capture is test-only. Production audit output streams to a writer.
+type auditBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *auditBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buffer.Len()+len(p) > 2*1024*1024 {
+		return 0, io.ErrShortBuffer
+	}
+	return b.buffer.Write(p)
+}
+func (b *auditBuffer) snapshot() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buffer.Bytes()...)
+}
+func validatePolicyAudit(t *testing.T, data []byte, capture *capturingIssuer) {
+	t.Helper()
+	text := string(data)
+	for _, key := range []string{`"lease_id"`, `"password"`, `"arguments"`, `"environment"`, `"connection_string"`} {
+		if strings.Contains(text, key) {
+			t.Error("sensitive audit field")
+		}
+	}
+	capture.mu.Lock()
+	for id, c := range capture.credentials {
+		for _, secret := range []string{id, c.Username, c.Password} {
+			if secret != "" && strings.Contains(text, secret) {
+				t.Error("credential value in audit")
+			}
+		}
+	}
+	capture.mu.Unlock()
+	for _, name := range []string{"RUNAWAYBAO_DATABASE_ROOT_TOKEN", "RUNAWAYBAO_DATABASE_MANAGER_PASSWORD"} {
+		if secret := os.Getenv(name); secret != "" && strings.Contains(text, secret) {
+			t.Error("bootstrap secret in audit")
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	decisions, gaps := 0, 0
+	for dec.More() {
+		var record map[string]json.RawMessage
+		if dec.Decode(&record) != nil {
+			t.Error("invalid audit JSON")
+			return
+		}
+		if _, ok := record["outcome"]; ok {
+			decisions++
+		}
+		if _, ok := record["type"]; ok {
+			gaps++
+		}
+	}
+	if decisions == 0 || gaps == 0 {
+		t.Error("missing decision or coverage records")
+	}
 }

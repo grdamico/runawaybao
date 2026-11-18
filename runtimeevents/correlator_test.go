@@ -158,3 +158,26 @@ func TestOutOfOrderExecutionIsMarkedLate(t *testing.T) {
 		t.Fatal("out-of-order execution not marked late")
 	}
 }
+
+func TestTerminationAndOutOfOrderAreDistinct(t *testing.T) {
+	c, e, i := setup(t)
+	later := e
+	later.Process.ExecID = "newer-event"
+	later.Process.Start = e.Process.Start.Add(time.Second)
+	_ = c.Resolve(later, i, true)
+	r := c.Resolve(e, i, true)
+	if !r.OutOfOrder || r.Terminated {
+		t.Fatal("active late event treated as terminated")
+	}
+	info := i[0]
+	info.Running = false
+	info.FinishedAt = time.Now()
+	if c.Retire(info) != nil {
+		t.Fatal("retire")
+	}
+	e.Process.ExecID = "historical"
+	r = c.Resolve(e, nil, true)
+	if !r.Terminated {
+		t.Fatal("terminated event not marked historical")
+	}
+}

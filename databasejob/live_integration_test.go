@@ -55,14 +55,20 @@ func (i *capturingIssuer) get(id string) openbao.DatabaseCredentials {
 // TestLiveDatabase bootstraps only a uniquely named OpenBao mount and policies.
 // PostgreSQL schema/manager setup is performed by postgres/init.sh. No root or
 // management credential is passed into the runner, manager, or query client.
-func TestLiveDatabase(t *testing.T) { runLive(t, false) }
+func TestLiveDatabase(t *testing.T) { runLive(t, false, false) }
 func TestLiveRuntime(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_RUNTIME_INTEGRATION") != "1" {
 		t.Skip("explicit runtime opt-in required")
 	}
-	runLive(t, true)
+	runLive(t, true, false)
 }
-func runLive(t *testing.T, observe bool) {
+func TestLivePolicy(t *testing.T) {
+	if os.Getenv("RUNAWAYBAO_POLICY_INTEGRATION") != "1" {
+		t.Skip("explicit dry-run policy opt-in required")
+	}
+	runLive(t, true, true)
+}
+func runLive(t *testing.T, observe, policy bool) {
 	if !observe && os.Getenv("RUNAWAYBAO_DATABASE_INTEGRATION") != "1" {
 		t.Skip("explicit live database opt-in required")
 	}
@@ -201,7 +207,7 @@ func runLive(t *testing.T, observe bool) {
 	if observe {
 		capture.observationDeadline = time.Now().Add(2*time.Minute + 2*time.Second)
 		t.Cleanup(func() { waitObservationExpiry(t, capture, uint16(port)) })
-		runObservation(t, capture, pg, manager)
+		runObservation(t, capture, pg, manager, policy)
 		return
 	}
 	t.Cleanup(func() {

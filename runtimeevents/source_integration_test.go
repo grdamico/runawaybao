@@ -87,6 +87,7 @@ func TestLiveWorkloadIdentity(t *testing.T) {
 	if d.Exec(ctx, container.ID) != nil {
 		t.Fatal("exec")
 	}
+	paths := map[string]bool{}
 	stats := map[string]int{}
 	shellIDs := map[string]bool{}
 	childParents := []string{}
@@ -109,6 +110,7 @@ func TestLiveWorkloadIdentity(t *testing.T) {
 				stats["sleep_event"]++
 			}
 			if e.Process.Docker == container.ID[:31] || e.Process.Docker == container.ID {
+				paths[e.Process.Binary] = true
 				if e.Process.Start.Before(info.StartedAt) {
 					t.Fatal("execution predates workload instance")
 				}
@@ -132,6 +134,7 @@ func TestLiveWorkloadIdentity(t *testing.T) {
 					for _, id := range topPIDs {
 						pid = pid || shellPIDs[id]
 					}
+					t.Logf("Controlled executable paths: %v", paths)
 					t.Logf("PASS: controlled shell and child have verified container identity; optional parent linkage: process.parent_exec_id=%t event.parent.exec_id=%t event.parent.pid=%t", direct, top, pid)
 					return
 				}

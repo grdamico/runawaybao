@@ -24,6 +24,7 @@ type binding struct {
 type Result struct {
 	Status, Reason, JobID, LeaseID, ContainerID, ExecID, ParentExecID string
 	Late                                                              bool
+	Terminated, OutOfOrder                                            bool
 }
 
 // Correlator accepts only read-only metadata lookup, not a database manager or
@@ -211,7 +212,9 @@ func (c *Correlator) Resolve(e Event, inventory []workload.Container, inventoryO
 	result.JobID = b.job
 	result.LeaseID = m.LeaseID
 	result.ContainerID = id
-	result.Late = !ended.IsZero() || (!b.latest.IsZero() && e.Process.Start.Before(b.latest))
+	result.Terminated = !ended.IsZero()
+	result.OutOfOrder = !b.latest.IsZero() && e.Process.Start.Before(b.latest)
+	result.Late = result.Terminated || result.OutOfOrder
 	if e.Process.Start.After(b.latest) {
 		b.latest = e.Process.Start
 		c.bindings[id] = b
