@@ -75,7 +75,7 @@ func (d *Database) Create(ctx context.Context, job string) (Resource, error) {
 	}
 	r.Phase = "container_create_pending"
 	d.save(r)
-	out, e = command(ctx, "create", "--name", r.ContainerName, "-i", "--label", ownerLabel+"="+d.docker.owner, "--user", "65534:65534", "--network", r.NetworkID, "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m", "--pids-limit", "32", "--memory", "64m", "--cpus", "0.25", "--restart", "no", d.image)
+	out, e = command(ctx, "create", "--name", r.ContainerName, "-i", "--label", ownerLabel+"="+d.docker.owner, "--user", "65534:65534", "--network", r.NetworkID, "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m", "--pids-limit", "32", "--memory", "64m", "--cpus", "0.25", "--restart", "no", "--cgroupns", "private", d.image)
 	if e != nil {
 		return r, e
 	}

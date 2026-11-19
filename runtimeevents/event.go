@@ -11,7 +11,16 @@ import (
 
 var ErrEvent = errors.New("invalid runtime event")
 
+type Namespace struct {
+	Inum uint32 `json:"inum"`
+	Host bool   `json:"is_host"`
+}
+
 type Process struct {
+	Namespaces *struct {
+		PID    Namespace `json:"pid"`
+		Cgroup Namespace `json:"cgroup"`
+	} `json:"ns"`
 	ExecID       string    `json:"exec_id"`
 	ParentExecID string    `json:"parent_exec_id"`
 	PID          uint32    `json:"pid"`

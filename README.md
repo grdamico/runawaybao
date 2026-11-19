@@ -202,6 +202,20 @@ The new live path requires Docker bridge `isolated` gateway mode. Network probes
 cover selected endpoints, not every host service or DNS exfiltration path. Read the
 [security model and full limitations](docs/security-model.md) before extending the lab.
 
+## Strong workload identity
+
+The opt-in identity test matches Tetragon's event-time PID and cgroup namespace
+pair to a pinned, Docker-verified workload generation. Existing prefix correlation
+continues to support observation. Strong assurance is a dry-run correlation
+result and grants no permission to act on a credential.
+
+```bash
+./scripts/test-container-database.sh identity
+```
+
+See [runtime correlation and identity assurance](docs/policy.md#workload-identity-assurance)
+for the distinction and its trust assumptions.
+
 ## Roadmap
 
 | Milestone | Status |
@@ -211,7 +225,8 @@ cover selected endpoints, not every host service or DNS exfiltration path. Read 
 | 3 — Tetragon ingestion and workload correlation | Completed |
 | 4 — Explicit policy evaluation and dry-run decisions | Completed |
 | 5 — Containerized database workloads, dry-run only | Completed |
-| 6 — Controlled enforcement: carefully scoped event-driven revocation | Planned |
+| 6A — Strong workload identity validation | Completed, verified in the local Docker Desktop lab |
+| 6B — Controlled enforcement | Planned |
 | Durable state, recovery, audit records, and stronger operational controls | Future |
 
 ## Documentation

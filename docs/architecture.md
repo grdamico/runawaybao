@@ -34,7 +34,7 @@ flowchart TB
         Manager["databasejob.Manager: prepare and one-shot delivery"]
         Registry["Immutable job / container / lease mapping"]
         Workloads["Docker lifecycle and retained ownership journal"]
-        Admission["Bind validated immutable policy before worker release"]
+        Admission["Bind policy and optional pinned namespace identity before worker release"]
     end
     subgraph Observer["Read-only observation and dry-run evaluation"]
         Consumer["Structured Tetragon JSON consumer"]
@@ -67,6 +67,8 @@ flowchart TB
     Workloads -->|"Create, inspect and owned cleanup"| Docker
     Workloads -->|"Bind full container ID"| Registry
     Admission -->|"Immutable policy binding"| Adapter
+    Tetragon -->|"Trusted host procfs via Docker exec"| Admission
+    Admission -->|"Optional identity proof and admission coverage"| Correlator
     Manager -->|"Bounded attached stdin after identity and policy binding"| A
     Manager -->|"Bounded attached stdin after identity and policy binding"| B
     Docker --> A
@@ -75,7 +77,7 @@ flowchart TB
     B -->|"Fixed SELECT"| PG
     A -.->|"Process execution"| Tetragon
     B -.->|"Process execution"| Tetragon
-    Tetragon -->|"tetra JSON stream"| Consumer
+    Tetragon -->|"Structured JSON with event-time namespaces"| Consumer
     Consumer --> Correlator
     Docker -->|"Fresh complete identity inventory"| Correlator
     Registry -->|"Read-only metadata lookup"| Correlator
@@ -262,13 +264,29 @@ and `worker/Dockerfile`. The opt-in live coordinator is
 `databasejob/container_integration_test.go`; its script is
 `scripts/test-container-database.sh`.
 
+## Milestone 6A admission and observation
+
+In the opt-in identity path, the existing bootstrap process waits on stdin.
+The controller checks the full Docker ID, owner, init PID, start time, restart
+count and namespace modes. It uses the trusted Tetragon container's host procfs
+view to verify the init's cgroup v2 path and pin both namespace objects. It
+rechecks Docker state before binding the proof and releasing the worker. Docker
+Desktop can assign different PID numbers to Docker inspection and event-time
+Tetragon observations, so joining those two numeric PIDs is unnecessary here.
+
+The correlator keeps the legacy result and adds a separate assurance result.
+The strong path needs the live proof, the event-time namespace pair and Docker
+prefix, a matching workload generation, fresh complete Docker inventory,
+matching uninterrupted coverage since admission, and a fresh, ordered exec.
+The proof is valid only in the current controller lifetime. Cleanup and
+controller cancellation release it.
+
 ## Milestone status and next phase
 
-Milestones 1–5 are completed and live-verified. **Milestone 6 — controlled
-enforcement — remains planned and unimplemented.** Current observations and
-`would_revoke_lease` audit strings invoke no revocation or workload-stop action.
-A future enforcement milestone requires a separate approved design; current
-identity uncertainty, coverage gaps and lifecycle limits still apply.
+Milestones 1–5 are completed and live-verified. Milestone 6A validates stronger
+workload identity in a dedicated local dry-run. **Milestone 6B, controlled
+enforcement, remains planned.** Identity assurance carries no permission to
+revoke a lease or stop a worker.
 
 ## Project structure
 

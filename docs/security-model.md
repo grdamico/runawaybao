@@ -159,3 +159,24 @@ A controller crash loses these journals; time-bounded workers can exit while sto
 containers, networks or PostgreSQL attachments remain. Operators must use retained
 exact resource IDs/names and ownership labels for manual recovery, never broad
 pruning. Lost issuance responses can still leave unknown leases until expiry.
+
+## Milestone 6A workload identity assumptions
+
+Strong assurance trusts the Linux kernel, Docker daemon, Tetragon service and
+controller. The lab admits only controller-owned, restricted workers with
+private PID and cgroup namespaces, no added capabilities and no worker access to
+the Docker API. A trusted Docker administrator or privileged host process can
+alter these conditions. A namespace inode alone is insufficient. The controller
+pins both kernel namespace objects through a bounded stdin-owned process in the
+trusted Tetragon container and binds them to the inspected Docker generation
+and the supported cgroup v2 path. The descriptors are held only for the current
+controller run. Controller exit, transport loss, cleanup and the holder timeout
+bound their lifetime.
+
+An event can carry a matching Docker prefix during runtime setup while
+reporting host namespaces. Such events retain their ordinary observation result
+and cannot receive strong namespace assurance. A change in generation, stale or
+late delivery, observation gap, or missing or conflicting evidence also rules
+out strong assurance. Unknown layouts are unsupported in strong mode. This
+laboratory check establishes workload identity only. It makes no assertion
+about binary integrity, intent, complete observation, or production readiness.

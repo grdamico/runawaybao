@@ -199,3 +199,23 @@ The new profile is selected by the live coordinator, not a default change to the
 standalone observer CLI catalog. That CLI keeps its existing Milestone 4 profiles
 and correlation-only default. Attaching it to the new profile would require an
 explicit catalog addition and trusted admission bindings.
+
+## Workload identity assurance
+
+The opt-in Milestone 6A path keeps existing policy evaluation and sanitized
+decision output. It classifies correlation evidence separately in the trusted
+controller.
+
+| Assurance | Meaning |
+|---|---|
+| `verified` | A fresh, ordered exec matches the Docker prefix, the pinned PID and cgroup namespace pair, the live workload generation, and uninterrupted observation since admission. |
+| `observation_only` | Ordinary correlation succeeded and some required strong evidence is unavailable. |
+| `unknown` | Ordinary correlation could not establish identity, or the event was rejected as a replay. |
+| `conflicting` | Identity fields disagree, including a namespace mismatch on an otherwise correlated event. |
+
+The freshness window uses the exec start time, with a 45-second maximum age and
+a two-second future clock allowance. The limit accommodates Tetragon's roughly
+30-second default event-cache retry budget plus transport and inspection. An
+expired admission pin or stream gap removes strong assurance for that admission.
+The policy evaluator retains its
+provider-independent interface and its recommendations remain audit-only.

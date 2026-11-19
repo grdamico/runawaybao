@@ -2,6 +2,19 @@
 # Disposable trusted bootstrap; credentials never passed to worker Docker config.
 set +x
 source "$(dirname "$0")/common.sh"
+test_name=TestLiveContainerDatabase
+case "${1:-}" in
+  "") ;;
+  identity)
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "Live workload identity validation is local only." >&2
+      exit 1
+    fi
+    export RUNAWAYBAO_IDENTITY_INTEGRATION=1
+    test_name=TestLiveWorkloadIdentity
+    ;;
+  *) echo "Usage: $0 [identity]" >&2; exit 1 ;;
+esac
 dc up -d openbao postgres tetragon
 for ((attempt=1; attempt<=60; attempt++)); do
   if ./scripts/status.sh >/dev/null 2>&1; then break; fi
@@ -15,4 +28,4 @@ export RUNAWAYBAO_DATABASE_ROOT_TOKEN="$BAO_TOKEN"
 export RUNAWAYBAO_DATABASE_PORT="${POSTGRES_PORT:-15432}"
 export RUNAWAYBAO_DATABASE_MANAGER_PASSWORD="${DB_MANAGER_PASSWORD:-runawaybao-manager-dev-only}"
 export RUNAWAYBAO_DATABASE_ADMIN_PASSWORD="${POSTGRES_PASSWORD:-runawaybao-admin-dev-only}"
-go test -tags=integration ./databasejob -run '^TestLiveContainerDatabase$' -count=1 -timeout 5m -v
+go test -tags=integration ./databasejob -run "^${test_name}$" -count=1 -timeout 5m -v

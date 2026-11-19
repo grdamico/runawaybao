@@ -11,6 +11,16 @@ import (
 )
 
 var ErrBinding = errors.New("invalid or duplicate workload binding")
+
+type Assurance string
+
+const (
+	UnknownIdentity     Assurance = "unknown"
+	ObservationOnly     Assurance = "observation_only"
+	ConflictingIdentity Assurance = "conflicting"
+	VerifiedIdentity    Assurance = "verified"
+)
+
 var shortID = regexp.MustCompile(`^[a-f0-9]{31}$`)
 
 type Metadata struct{ JobID, WorkloadID, LeaseID string }
@@ -20,8 +30,13 @@ type binding struct {
 	started, finished, retired time.Time
 	latest                     time.Time
 	invalid                    bool
+	identity                   func(workload.Container) (uint32, uint32, bool)
+	pidNS, cgroupNS            uint32
+	coverage                   Coverage
 }
 type Result struct {
+	Assurance                                                         Assurance
+	AssuranceReason                                                   string
 	Status, Reason, JobID, LeaseID, ContainerID, ExecID, ParentExecID string
 	Late                                                              bool
 	Terminated, OutOfOrder                                            bool
@@ -74,11 +89,34 @@ func (c *Correlator) Register(id, job string) error {
 	return nil
 }
 func (c *Correlator) Activate(info workload.Container) error {
+	return c.activate(info, nil, Coverage{})
+}
+
+func (c *Correlator) ActivateIdentity(info workload.Container, identity *workload.Identity, coverage Coverage) error {
+	if identity == nil || coverage.Status != "observing" {
+		return ErrBinding
+	}
+	return c.activate(info, identity.Namespaces, coverage)
+}
+
+func (c *Correlator) activate(info workload.Container, identity func(workload.Container) (uint32, uint32, bool), coverage Coverage) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b, ok := c.bindings[info.ID]
 	if !ok || !b.started.IsZero() || !info.Running || info.StartedAt.IsZero() || info.Restarts != 0 {
 		return ErrBinding
+	}
+	if identity != nil {
+		pid, cgroup, ok := identity(info)
+		if !ok {
+			return ErrBinding
+		}
+		for _, existing := range c.bindings {
+			if existing.identity != nil && (pid == existing.pidNS || cgroup == existing.cgroupNS) {
+				return ErrBinding
+			}
+		}
+		b.pidNS, b.cgroupNS, b.identity, b.coverage = pid, cgroup, identity, coverage
 	}
 	b.started = info.StartedAt
 	c.bindings[info.ID] = b
@@ -108,12 +146,22 @@ func normalizedFull(s string) string {
 	return s
 }
 func (c *Correlator) Resolve(e Event, inventory []workload.Container, inventoryOK bool) Result {
+	return c.ResolveObserved(e, inventory, inventoryOK, Coverage{})
+}
+
+func (c *Correlator) ResolveObserved(e Event, inventory []workload.Container, inventoryOK bool, coverage Coverage) Result {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
 	c.prune(now)
-	result := Result{Status: "uncorrelated", ExecID: e.Process.ExecID, ParentExecID: e.Process.ParentExecID}
-	reject := func(reason string) Result { result.Reason = reason; return result }
+	result := Result{Assurance: UnknownIdentity, Status: "uncorrelated", ExecID: e.Process.ExecID, ParentExecID: e.Process.ParentExecID}
+	reject := func(reason string) Result {
+		result.Reason, result.AssuranceReason = reason, reason
+		if reason == "conflicting_identity" {
+			result.Assurance = ConflictingIdentity
+		}
+		return result
+	}
 	if !inventoryOK {
 		return reject("inventory_unavailable")
 	}
@@ -215,6 +263,7 @@ func (c *Correlator) Resolve(e Event, inventory []workload.Container, inventoryO
 	result.Terminated = !ended.IsZero()
 	result.OutOfOrder = !b.latest.IsZero() && e.Process.Start.Before(b.latest)
 	result.Late = result.Terminated || result.OutOfOrder
+	result.Assurance, result.AssuranceReason = assessIdentity(b, e, info, result.Late, coverage, now)
 	if e.Process.Start.After(b.latest) {
 		b.latest = e.Process.Start
 		c.bindings[id] = b
@@ -237,4 +286,35 @@ func (c *Correlator) NeedsInventory(e Event) bool {
 		}
 	}
 	return false
+}
+
+// Only execs within the bounded freshness window can support strong identity.
+// The lab allows for Tetragon's roughly 30-second event-cache retry budget
+// plus transport and fresh Docker inspection.
+func assessIdentity(b binding, e Event, info workload.Container, late bool, coverage Coverage, now time.Time) (Assurance, string) {
+	if b.identity == nil {
+		return ObservationOnly, "admission_identity_unavailable"
+	}
+	ns := e.Process.Namespaces
+	if ns == nil {
+		return ObservationOnly, "event_identity_incomplete"
+	}
+	if ns.PID.Host || ns.Cgroup.Host ||
+		(ns.PID.Inum != 0 && ns.PID.Inum != b.pidNS) ||
+		(ns.Cgroup.Inum != 0 && ns.Cgroup.Inum != b.cgroupNS) {
+		return ConflictingIdentity, "namespace_mismatch"
+	}
+	if ns.PID.Inum == 0 || ns.Cgroup.Inum == 0 || e.Process.Docker == "" {
+		return ObservationOnly, "event_identity_incomplete"
+	}
+	if _, _, ok := b.identity(info); late || !ok {
+		return ObservationOnly, "lifecycle_unverified"
+	}
+	if coverage.Status != "observing" || coverage.Generation != b.coverage.Generation {
+		return ObservationOnly, "coverage_unverified"
+	}
+	if age := now.Sub(e.Process.Start); age > 45*time.Second || age < -2*time.Second {
+		return ObservationOnly, "event_freshness_unverified"
+	}
+	return VerifiedIdentity, "namespace_binding_matched"
 }

@@ -60,22 +60,28 @@ func TestLiveContainerDatabase(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_CONTAINER_DATABASE_INTEGRATION") != "1" {
 		t.Skip("explicit container database opt-in required")
 	}
-	runLive(t, true, true, true)
+	runLive(t, true, true, true, false)
 }
-func TestLiveDatabase(t *testing.T) { runLive(t, false, false, false) }
+func TestLiveDatabase(t *testing.T) { runLive(t, false, false, false, false) }
 func TestLiveRuntime(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_RUNTIME_INTEGRATION") != "1" {
 		t.Skip("explicit runtime opt-in required")
 	}
-	runLive(t, true, false, false)
+	runLive(t, true, false, false, false)
 }
 func TestLivePolicy(t *testing.T) {
 	if os.Getenv("RUNAWAYBAO_POLICY_INTEGRATION") != "1" {
 		t.Skip("explicit dry-run policy opt-in required")
 	}
-	runLive(t, true, true, false)
+	runLive(t, true, true, false, false)
 }
-func runLive(t *testing.T, observe, policy, container bool) {
+func TestLiveWorkloadIdentity(t *testing.T) {
+	if os.Getenv("RUNAWAYBAO_IDENTITY_INTEGRATION") != "1" || os.Getenv("GITHUB_ACTIONS") != "" {
+		t.Skip("explicit local workload identity opt-in required")
+	}
+	runLive(t, true, true, true, true)
+}
+func runLive(t *testing.T, observe, policy, container, identity bool) {
 	if !observe && os.Getenv("RUNAWAYBAO_DATABASE_INTEGRATION") != "1" {
 		t.Skip("explicit live database opt-in required")
 	}
@@ -225,7 +231,7 @@ func runLive(t *testing.T, observe, policy, container bool) {
 			if e != nil {
 				t.Fatal("workload manager setup failed")
 			}
-			runContainerDatabase(t, capture, manager, uint16(port))
+			runContainerDatabase(t, capture, manager, uint16(port), identity)
 		} else {
 			runObservation(t, capture, pg, manager, policy)
 		}

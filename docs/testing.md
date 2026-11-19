@@ -370,3 +370,33 @@ YAML parsing, local documentation file links and whitespace checks passed.
 Final health checks found all three project services healthy, no remaining
 observation-owned containers or networks, and zero `tetra` CLI readers. Services
 and the reusable local worker image were intentionally left available.
+
+## Milestone 6A live identity validation
+
+Run against the disposable Docker Desktop lab with cgroup v2 and Tetragon
+v1.7.0. The Compose configuration enables `--enable-process-ns`.
+
+```bash
+./scripts/test-container-database.sh identity
+```
+
+Run this suite on its own so concurrent live suites do not flood the shared
+observation stream. The opt-in runs the existing worker/network checks and adds namespace assurance
+for two independent workers and the short-lived B helper. Each positive
+assertion uses the actual structured Tetragon exec event. The full container
+ID and namespace pins come from trusted Docker inspection and host procfs.
+Both original PostgreSQL credentials must still work on fresh authenticated
+connections inside the workers. The harness checks raw transport and sanitized
+output for sensitive values, removes owned workload resources, and waits for
+lease expiry before removing the temporary role setup.
+
+Missing and malformed namespace evidence, conflicts, shared namespaces,
+restart, replay, late and stale events, and coverage loss are exercised
+separately with synthetic correlation tests. The live identity harness skips
+in GitHub Actions. CI continues to compile integration-tag tests.
+
+On 2026-11-19 the local Docker Desktop lab verified distinct event-time pairs
+for both database workers and for B's short-lived helper. Both workers
+reauthenticated afterward, and the test removed its owned resources. The
+initial 30-second freshness bound withheld strong assurance for delayed helper
+events. The verified run used the documented 45-second bound.

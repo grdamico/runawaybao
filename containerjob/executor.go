@@ -24,16 +24,19 @@ func Policies() []executionpolicy.Policy {
 
 type Execution struct {
 	session   *workload.Session
+	identity  *workload.Identity
 	PID       uint32
 	executing bool
 }
 type Executor struct {
-	mu         sync.Mutex
-	manager    *databasejob.Manager
-	docker     *workload.Database
-	correlator *runtimeevents.Correlator
-	audit      *policyaudit.Adapter
-	jobs       map[string]*Execution
+	mu            sync.Mutex
+	manager       *databasejob.Manager
+	docker        *workload.Database
+	correlator    *runtimeevents.Correlator
+	audit         *policyaudit.Adapter
+	jobs          map[string]*Execution
+	identityAgent string
+	observation   *runtimeevents.Consumer
 }
 
 func New(m *databasejob.Manager, d *workload.Database, c *runtimeevents.Correlator, a *policyaudit.Adapter) (*Executor, error) {
@@ -48,6 +51,18 @@ func New(m *databasejob.Manager, d *workload.Database, c *runtimeevents.Correlat
 	}
 	return &Executor{manager: m, docker: d, correlator: c, audit: a, jobs: make(map[string]*Execution)}, nil
 }
+
+// NewWithIdentity enables only namespace assurance. The worker's bootstrap
+// waits for credentials until its identity and observation generation are bound.
+func NewWithIdentity(m *databasejob.Manager, d *workload.Database, c *runtimeevents.Correlator, a *policyaudit.Adapter, agent string, observation *runtimeevents.Consumer) (*Executor, error) {
+	e, err := New(m, d, c, a)
+	if err != nil || !workload.IDPattern.MatchString(agent) || observation == nil {
+		return nil, ErrExecution
+	}
+	e.identityAgent, e.observation = agent, observation
+	return e, nil
+}
+
 func (e *Executor) Execute(ctx context.Context, job string) error {
 	if !executionpolicy.ValidIdentifier(job) {
 		return ErrExecution
@@ -71,6 +86,13 @@ func (e *Executor) Execute(ctx context.Context, job string) error {
 	if e.manager.BindWorkload(job, r.ContainerID) != nil || e.correlator.Register(r.ContainerID, job) != nil || e.audit.Bind(policyaudit.Binding{JobID: job, WorkloadID: r.ContainerID, PolicyID: "container-reader", PolicyVersion: "v1"}) != nil {
 		return ErrExecution
 	}
+	var coverage runtimeevents.Coverage
+	if e.observation != nil {
+		coverage = e.observation.Coverage()
+		if coverage.Status != "observing" {
+			return ErrExecution
+		}
+	}
 	s, info, err := e.docker.Start(ctx, job)
 	if err != nil {
 		return ErrExecution
@@ -78,7 +100,22 @@ func (e *Executor) Execute(ctx context.Context, job string) error {
 	e.mu.Lock()
 	x.session = s
 	e.mu.Unlock()
-	if e.correlator.Activate(info) != nil || e.manager.Deliver(ctx, job, s.Deliver) != nil {
+	if e.observation != nil {
+		proof, err := e.docker.PinIdentity(ctx, e.identityAgent, job, info)
+		if err != nil {
+			return ErrExecution
+		}
+		if coverage != e.observation.Coverage() || e.correlator.ActivateIdentity(info, proof, coverage) != nil {
+			proof.Close()
+			return ErrExecution
+		}
+		e.mu.Lock()
+		x.identity = proof
+		e.mu.Unlock()
+	} else if e.correlator.Activate(info) != nil {
+		return ErrExecution
+	}
+	if e.manager.Deliver(ctx, job, s.Deliver) != nil {
 		return ErrExecution
 	}
 	pid, err := s.Read(ctx)
@@ -135,6 +172,9 @@ func (e *Executor) Cleanup(ctx context.Context, job string) error {
 	e.mu.Lock()
 	x := e.jobs[job]
 	busy := x != nil && x.executing
+	if !busy && x != nil && x.identity != nil {
+		x.identity.Close()
+	}
 	e.mu.Unlock()
 	if busy {
 		return ErrExecution

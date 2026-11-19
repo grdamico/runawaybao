@@ -70,7 +70,7 @@ type scannedStream struct {
 	io.Closer
 }
 
-func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob.Manager, port uint16) {
+func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob.Manager, port uint16, identity bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
@@ -94,19 +94,6 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 		r, ok := m.Lookup(id)
 		return runtimeevents.Metadata{JobID: r.JobID, WorkloadID: r.WorkloadID, LeaseID: r.LeaseID}, ok
 	})
-	executor, err := containerjob.New(m, docker, corr, adapter)
-	if err != nil {
-		t.Fatal("executor setup failed")
-	}
-	defer func() {
-		cleanup, stop := context.WithTimeout(context.Background(), 25*time.Second)
-		defer stop()
-		for _, id := range []string{"A", "B"} {
-			if executor.Cleanup(cleanup, id) != nil || executor.Cleanup(cleanup, id) != nil {
-				t.Error("owned resource cleanup unconfirmed; journal retained")
-			}
-		}
-	}()
 	service, err := workload.Service(ctx, "tetragon")
 	if err != nil {
 		t.Fatal("Tetragon service unavailable")
@@ -120,18 +107,38 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 		}
 		return scannedStream{Reader: io.TeeReader(s, scan), Closer: s}, nil
 	})
+	executor, err := containerjob.New(m, docker, corr, adapter)
+	if identity {
+		executor, err = containerjob.NewWithIdentity(m, docker, corr, adapter, service, consumer)
+	}
+	if err != nil {
+		t.Fatal("executor setup failed")
+	}
+	defer func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 25*time.Second)
+		defer stop()
+		for _, id := range []string{"A", "B"} {
+			if executor.Cleanup(cleanup, id) != nil || executor.Cleanup(cleanup, id) != nil {
+				t.Error("owned resource cleanup unconfirmed; journal retained")
+			}
+		}
+	}()
 	done := make(chan error, 1)
 	go func() { done <- consumer.Run(ctx) }()
 	var auditBytes auditBuffer
 	audit := policyaudit.NewWriter(&auditBytes)
 	var mu sync.Mutex
 	allowed := map[string]bool{}
+	strong := map[string]bool{}
+	strongHelper := false
+	namespacePairs := map[string][2]uint32{}
 	suspicious := false
 	wrong := false
 	child := false
 	lineage := false
 	unknownSeen := false
 	diagnostics := map[string]int{}
+	var helperAge time.Duration
 	resolved := make(chan struct{})
 	go func() {
 		defer close(resolved)
@@ -157,8 +164,9 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 				if corr.NeedsInventory(e) {
 					inv, err = workload.Inventory(ctx)
 				}
-				r := corr.Resolve(e, inv, err == nil)
-				d := adapter.Evaluate(e, r, consumer.EffectiveCoverage(n))
+				coverage := consumer.EffectiveCoverage(n)
+				r := corr.ResolveObserved(e, inv, err == nil, coverage)
+				d := adapter.Evaluate(e, r, coverage)
 				if audit.Decision(d) != nil {
 					t.Error("audit write failed")
 					return
@@ -173,10 +181,27 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 				case "/runawaybao-netprobe":
 					category = "probe"
 				}
+				if category == "helper" {
+					helperAge = time.Since(e.Process.Start).Round(time.Millisecond)
+				}
 				if category != "other" {
-					diagnostics[category+":"+r.Status+":"+r.Reason+":"+string(d.Outcome)+":"+d.Reason]++
+					diagnostics[category+":"+r.Status+":"+r.Reason+":"+string(d.Outcome)+":"+d.Reason+":"+r.AssuranceReason]++
 				}
 				if r.Status == "correlated" {
+					if r.Assurance == runtimeevents.VerifiedIdentity {
+						ns := e.Process.Namespaces
+						pair := [2]uint32{ns.PID.Inum, ns.Cgroup.Inum}
+						if old, exists := namespacePairs[r.JobID]; exists && old != pair {
+							wrong = true
+						}
+						namespacePairs[r.JobID] = pair
+						if category == "worker" {
+							strong[r.JobID] = true
+						}
+						if category == "helper" && r.JobID == "B" {
+							strongHelper = true
+						}
+					}
 					record, _ := m.Lookup(r.JobID)
 					if record.WorkloadID != r.ContainerID || record.LeaseID != r.LeaseID || !strings.HasPrefix(r.ContainerID, e.Process.Docker) {
 						wrong = true
@@ -309,6 +334,10 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 	for {
 		mu.Lock()
 		complete := allowed["A"] && allowed["B"] && suspicious && child && unknownSeen
+		if identity {
+			a, b := namespacePairs["A"], namespacePairs["B"]
+			complete = complete && strong["A"] && strong["B"] && strongHelper && a[0] != b[0] && a[1] != b[1]
+		}
 		bad := wrong
 		mu.Unlock()
 		if bad {
@@ -319,9 +348,9 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 		}
 		if time.Now().After(deadline) {
 			mu.Lock()
-			t.Logf("Safe event diagnostics: %v; A allowed=%t B allowed=%t child=%t suspicious=%t", diagnostics, allowed["A"], allowed["B"], child, suspicious)
+			t.Logf("Safe event diagnostics: %v; A allowed=%t B allowed=%t child=%t suspicious=%t helper age=%s", diagnostics, allowed["A"], allowed["B"], child, suspicious, helperAge)
 			mu.Unlock()
-			t.Fatal("worker allowlist and child suspicious decisions not observed")
+			t.Fatal("required worker and helper observations did not meet the validation criteria")
 		}
 		select {
 		case <-ctx.Done():
@@ -330,6 +359,9 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 		}
 	}
 	t.Log("PASS: exact worker paths allowed for A/B; B child correlated only to B and suspicious in dry-run")
+	if identity {
+		t.Log("PASS: distinct Docker-verified PID and cgroup namespace pairs matched live A/B worker execs and the short-lived B helper")
+	}
 	mu.Lock()
 	parentMetadata := lineage
 	mu.Unlock()

@@ -181,3 +181,100 @@ func TestTerminationAndOutOfOrderAreDistinct(t *testing.T) {
 		t.Fatal("terminated event not marked historical")
 	}
 }
+
+func TestNamespaceAssurance(t *testing.T) {
+	coverage := Coverage{Status: "observing", Generation: 2}
+	for _, tc := range []struct {
+		name   string
+		want   Assurance
+		change func(*Correlator, *Event, *[]workload.Container, *Coverage)
+	}{
+		{"matching", VerifiedIdentity, func(*Correlator, *Event, *[]workload.Container, *Coverage) {}},
+		{"missing", ObservationOnly, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) { e.Process.Namespaces = nil }},
+		{"partial", ObservationOnly, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) {
+			e.Process.Namespaces.Cgroup.Inum = 0
+		}},
+		{"conflicting PID", ConflictingIdentity, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) { e.Process.Namespaces.PID.Inum++ }},
+		{"conflicting cgroup", ConflictingIdentity, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) {
+			e.Process.Namespaces.Cgroup.Inum++
+		}},
+		{"host namespace", ConflictingIdentity, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) {
+			e.Process.Namespaces.Cgroup.Host = true
+		}},
+		{"coverage loss", ObservationOnly, func(_ *Correlator, _ *Event, _ *[]workload.Container, c *Coverage) { c.Generation++ }},
+		{"restart", UnknownIdentity, func(_ *Correlator, _ *Event, i *[]workload.Container, _ *Coverage) { (*i)[0].Restarts++ }},
+		{"replacement", UnknownIdentity, func(_ *Correlator, _ *Event, i *[]workload.Container, _ *Coverage) { (*i)[0].StartedAt = time.Now() }},
+		{"stale", ObservationOnly, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) {
+			e.Process.Start = time.Now().Add(-60 * time.Second)
+		}},
+		{"future", ObservationOnly, func(_ *Correlator, e *Event, _ *[]workload.Container, _ *Coverage) {
+			e.Process.Start = time.Now().Add(5 * time.Second)
+		}},
+		{"terminated", ObservationOnly, func(_ *Correlator, _ *Event, i *[]workload.Container, _ *Coverage) {
+			(*i)[0].Running = false
+			(*i)[0].FinishedAt = time.Now()
+		}},
+		{"out of order", ObservationOnly, func(c *Correlator, e *Event, i *[]workload.Container, v *Coverage) {
+			newer := *e
+			newer.Process.ExecID = "newer"
+			newer.Process.Start = newer.Process.Start.Add(time.Millisecond)
+			c.ResolveObserved(newer, *i, true, *v)
+		}},
+		{"replay", UnknownIdentity, func(c *Correlator, e *Event, i *[]workload.Container, v *Coverage) {
+			c.ResolveObserved(*e, *i, true, *v)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, original, inventory := setup(t)
+			id := inventory[0].ID
+			// Use the real parser for the namespace fields, and synthetic trusted
+			// admission evidence so negative cases never touch Docker.
+			e, _, err := Parse([]byte(`{"process_exec":{"process":{"ns":{"pid":{"inum":11},"cgroup":{"inum":22}}}}}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.Process.Docker, e.Process.ExecID = original.Process.Docker, original.Process.ExecID
+			e.Process.Start, e.Time = time.Now().Add(-time.Second), time.Now()
+			b := c.bindings[id]
+			b.pidNS, b.cgroupNS, b.coverage = 11, 22, coverage
+			b.identity = func(info workload.Container) (uint32, uint32, bool) { return 11, 22, info.Running }
+			c.bindings[id] = b
+			v := coverage
+			tc.change(c, &e, &inventory, &v)
+			if r := c.ResolveObserved(e, inventory, true, v); r.Assurance != tc.want {
+				t.Fatalf("assurance %q (%s), want %q", r.Assurance, r.AssuranceReason, tc.want)
+			}
+		})
+	}
+}
+
+func TestStrongAdmissionRejectsEitherSharedNamespace(t *testing.T) {
+	for _, pair := range [][2]uint32{{11, 33}, {44, 22}} {
+		c, _, inventory := setup(t)
+		a := inventory[0].ID
+		b := strings.Repeat("b", 64)
+		c.lookup = func(job string) (Metadata, bool) { return Metadata{job, b, "lease-B"}, job == "B" }
+		if err := c.Register(b, "B"); err != nil {
+			t.Fatal(err)
+		}
+		first := c.bindings[a]
+		first.pidNS, first.cgroupNS = 11, 22
+		first.identity = func(workload.Container) (uint32, uint32, bool) { return 11, 22, true }
+		c.bindings[a] = first
+		info := workload.Container{ID: b, StartedAt: time.Now(), Running: true}
+		if err := c.activate(info, func(workload.Container) (uint32, uint32, bool) { return pair[0], pair[1], true }, Coverage{Status: "observing"}); err == nil {
+			t.Fatal("shared namespace admitted")
+		}
+	}
+}
+
+func TestMalformedNamespaceMetadata(t *testing.T) {
+	for _, payload := range []string{
+		`{"process_exec":{"process":{"ns":{"pid":{"inum":"11"},"cgroup":{"inum":22}}}}}`,
+		`{"process_exec":{"process":{"ns":{"pid":{"inum":11},"cgroup":{"inum":-1}}}}}`,
+	} {
+		if _, _, err := Parse([]byte(payload)); err == nil {
+			t.Fatal("malformed namespace evidence was accepted")
+		}
+	}
+}

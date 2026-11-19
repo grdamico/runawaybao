@@ -23,12 +23,15 @@ var ErrDocker = errors.New("Docker operation failed; diagnostics suppressed")
 var IDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 const ownerLabel = "runawaybao.observation-owner"
-const inspectFormat = `{"id":{{json .Id}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"running":{{json .State.Running}},"restarts":{{json .RestartCount}},"owner":{{json (index .Config.Labels "runawaybao.observation-owner")}}}`
+const inspectFormat = `{"id":{{json .Id}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"pid":{{json .State.Pid}},"pid_mode":{{json .HostConfig.PidMode}},"cgroup_mode":{{json .HostConfig.CgroupnsMode}},"running":{{json .State.Running}},"restarts":{{json .RestartCount}},"owner":{{json (index .Config.Labels "runawaybao.observation-owner")}}}`
 
 type Container struct {
 	ID         string    `json:"id"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
+	PIDMode    string    `json:"pid_mode"`
+	CgroupMode string    `json:"cgroup_mode"`
+	PID        uint32    `json:"pid"`
 	Running    bool      `json:"running"`
 	Restarts   int       `json:"restarts"`
 	Owner      string    `json:"owner"`
