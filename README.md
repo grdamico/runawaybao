@@ -1,4 +1,4 @@
-# RunawayBao
+![RunawayBao banner with a teal steaming bao logo and wordmark](assets/runawaybao-banner.png)
 
 **Link temporary credentials to workload identity and runtime activity.**
 
@@ -249,6 +249,9 @@ from an active WSL terminal.
 | Broader durable state, automated recovery, and operational controls | Future |
 
 ## Documentation
+
+- [v0.1.0 Lab Preview release notes](docs/releases/v0.1.0.md)
+- [Changelog](CHANGELOG.md)
 
 - [Architecture, capabilities, and project structure](docs/architecture.md)
 - [Security model and reliability limits](docs/security-model.md)

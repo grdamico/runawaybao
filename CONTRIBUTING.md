@@ -13,10 +13,9 @@ clearly; do not present mocked outcomes as live evidence.
 
 Changes to identity attribution, credential delivery, policy semantics, or
 revocation need an explicit design discussion. Preserve the separation between
-observation and enforcement. Milestones 1–5 are complete and dry-run runtime
-evaluation is implemented; Milestone 6 controlled enforcement remains planned.
-Never weaken identity or authorization checks to
-make a demonstration pass.
+observation and enforcement. Milestones 1–6B are live-verified in the local
+lab. Dry-run remains the default and the separate enforcement test requires
+operator confirmation. Preserve identity and authorization checks in demonstrations.
 
 ## Local checks
 
@@ -57,8 +56,8 @@ public issues. Use GitHub private vulnerability reporting if enabled; no private
 reporting channel is configured or promised by this document.
 
 Execution policy changes must keep the evaluator pure, preserve immutable versions,
-and distinguish unknown from allowed. Do not add enforcement capabilities or
-serialize raw event/correlation structures into audit output. Run the policy live
+and distinguish unknown from allowed. Keep enforcement in the trusted
+controller and raw event and correlation structures out of audit output. Run the policy live
 suite when changing normalization, profile paths, or live policy wiring.
 
 For containerized database changes, run `./scripts/test-container-database.sh`
@@ -68,4 +67,9 @@ Keep its results separate from the legacy controller-query demonstrations. Valid
 Markdown file links and heading anchors, demo mode names, and Mermaid diagrams
 when updating documentation. Review tracked, staged and non-ignored new files
 before committing; `.env.example` is the intentional placeholder-only exception
-for environment configuration.
+for environment configuration. Keep the private enforcement journal outside the
+repository.
+
+Before every commit and push, verify that documentation accurately reflects
+implemented and verified functionality. Update the changelog and release notes
+when preparing a release.
