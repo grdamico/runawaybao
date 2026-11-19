@@ -3,9 +3,12 @@
 package executionpolicy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -52,6 +55,20 @@ func (p *CompiledPolicy) Identity() (string, string) {
 		return "", ""
 	}
 	return p.id, p.version
+}
+
+// Digest identifies the validated policy independently of allowlist ordering.
+func (p *CompiledPolicy) Digest() string {
+	if p == nil {
+		return ""
+	}
+	paths := make([]string, 0, len(p.paths))
+	for name := range p.paths {
+		paths = append(paths, name)
+	}
+	sort.Strings(paths)
+	sum := sha256.Sum256([]byte(p.id + "\x00" + p.version + "\x00" + strings.Join(paths, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 type Outcome string

@@ -53,6 +53,13 @@ flowchart TB
     subgraph NetB["Owned internal IPv4-only isolated network B"]
         B["B: bootstrap gate, re-exec, fixed pgx read"]
     end
+    subgraph Enforcement["Explicit local enforcement"]
+        Guard["Authorization and revalidation"]
+        Journal["Protected operation journal"]
+        Revoker["Restricted synchronous exact-lease client"]
+    end
+    Operator["Local operator: exact target and run confirmation"]
+    Verifier["Test-only fresh PostgreSQL authentication verifier"]
     Legacy["Separate legacy KV and explicit revocation demonstrations"]
     Setup -.-> Bao
     Setup -.-> PG
@@ -84,12 +91,24 @@ flowchart TB
     Correlator --> Adapter
     Adapter --> Policy
     Policy --> Audit
+    Operator --> Guard
+    Consumer -->|"Original accepted observation"| Guard
+    Correlator -->|"Verified workload generation"| Guard
+    Policy -->|"Pure decision"| Guard
+    Registry -->|"Reserved private issuance record"| Guard
+    Guard -->|"Durable dispatch intent"| Journal
+    Guard -->|"Exact lease from reservation"| Revoker
+    Revoker --> Bao
+    Revoker -->|"OpenBao acknowledgement"| Guard
+    Guard -->|"Sanitized stage records"| Audit
+    Verifier -->|"Fresh authentication for A and B"| PG
+    Verifier -->|"Independent database result"| Audit
     Legacy -->|"Separate restricted clients"| Bao
 ```
 
 Milestone 5 unifies database execution and monitoring in the same container.
 Milestones 2–4 retain their original controller-query demonstrations for regression.
-There is no event-to-revocation path. The runner remains a library with laboratory
+The default observation path is dry-run. The runner remains a library with laboratory
 entry points, not an authenticated submission service or scheduler.
 
 ## Current capabilities
@@ -284,9 +303,11 @@ controller cancellation release it.
 ## Milestone status and next phase
 
 Milestones 1–5 are completed and live-verified. Milestone 6A validates stronger
-workload identity in a dedicated local dry-run. **Milestone 6B, controlled
-enforcement, remains planned.** Identity assurance carries no permission to
-revoke a lease or stop a worker.
+workload identity in a dedicated local dry-run. **Milestone 6B is complete under
+the explicitly authorized local lab assumptions.** Its opt-in controller checks
+authorization, revalidates pinned policy and identity, and journals intent before
+calling the restricted OpenBao revoker. The live test separately verified OpenBao
+acknowledgement and the A/B PostgreSQL authentication results.
 
 ## Project structure
 

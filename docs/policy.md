@@ -3,7 +3,8 @@
 [Project overview](../README.md) · [Architecture](architecture.md) · [Security model](security-model.md)
 
 Milestone 4 evaluates correlated execution records against explicit workload
-allowlists and emits explainable **dry-run** JSON. It has no enforcement mode.
+allowlists and emits explainable **dry-run** JSON. The evaluator has no enforcement mode. The separate opt-in 6B controller
+re-evaluates its findings against fresh trusted state before revocation.
 A `suspicious` outcome means a policy deviation, not proof of malicious intent.
 
 ## Boundaries and data flow

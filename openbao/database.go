@@ -58,6 +58,7 @@ func NewLeaseRevoker(config Config, mount, role string) (*LeaseRevoker, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.http.Transport = &http.Transport{DisableKeepAlives: true}
 	return &LeaseRevoker{c, p}, nil
 }
 func validLease(prefix, id string) bool {
@@ -72,6 +73,9 @@ func (c *Client) databaseRequest(ctx context.Context, method, path string, paylo
 	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+"/v1/"+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, ErrRequest
+	}
+	if method == http.MethodPost {
+		req.GetBody = nil
 	}
 	req.Header.Set("X-Vault-Token", c.token)
 	req.Header.Set("Content-Type", "application/json")

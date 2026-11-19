@@ -278,3 +278,37 @@ func TestMalformedNamespaceMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestDispatchRecheckRejectsChangedEvidence(t *testing.T) {
+	c, e, inventory := setup(t)
+	e.Process.Start, e.Time = time.Now().Add(-time.Second), time.Now()
+	parsed, _, err := Parse([]byte(`{"process_exec":{"process":{"ns":{"pid":{"inum":11},"cgroup":{"inum":22}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Process.Namespaces = parsed.Process.Namespaces
+	info := inventory[0]
+	b := c.bindings[info.ID]
+	coverage := Coverage{Status: "observing"}
+	b.pidNS, b.cgroupNS, b.coverage = 11, 22, coverage
+	b.identity = func(candidate workload.Container) (uint32, uint32, bool) {
+		return 11, 22, candidate == info
+	}
+	c.bindings[info.ID] = b
+	resolved := c.ResolveObserved(e, inventory, true, coverage)
+	if !c.RecheckIdentity(e, resolved, inventory, coverage) {
+		t.Fatal("current evidence refused")
+	}
+	changed := info
+	changed.Restarts = 1
+	if c.RecheckIdentity(e, resolved, []workload.Container{changed}, coverage) {
+		t.Fatal("restarted generation accepted")
+	}
+	if c.RecheckIdentity(e, resolved, inventory, Coverage{Status: "observing", Generation: 1}) {
+		t.Fatal("coverage gap accepted")
+	}
+	ambiguous := workload.Container{ID: info.ID[:31] + strings.Repeat("b", 33)}
+	if c.RecheckIdentity(e, resolved, append(inventory, ambiguous), coverage) {
+		t.Fatal("ambiguous inventory accepted")
+	}
+}

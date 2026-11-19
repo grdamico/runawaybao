@@ -85,7 +85,8 @@ confirms cleanup nor clears credentials.
 - **Prefix identity:** uniqueness depends on current Docker inventory and retained
   bindings, not a complete history of unrelated removed containers. An adversarial
   Docker administrator is outside the trust model. Stronger identity assurance
-  is needed before using these results as an enforcement foundation.
+  is required for the opt-in enforcement path. See the namespace identity
+  assumptions below.
 - **Lineage and clocks:** immediate parent metadata was incomplete in this
   environment. Lifecycle checks use `process.start_time`, not event envelope time
   or WSL receipt time. Startup events before binding activation stay uncorrelated.
@@ -180,3 +181,36 @@ late delivery, observation gap, or missing or conflicting evidence also rules
 out strong assurance. Unknown layouts are unsupported in strong mode. This
 laboratory check establishes workload identity only. It makes no assertion
 about binary integrity, intent, complete observation, or production readiness.
+
+## Controlled enforcement and recovery
+
+The opt-in coordinator revalidates the original event under the immutable
+policy and its content digest. It requires the same observing consumer, a
+fresh complete Docker inventory, the pinned execution identity, and the exact
+lease from the private issuance registry. Its lock order is the per-execution
+lifecycle reservation, the private manager entry reservation, then the local
+journal. Docker and OpenBao calls run outside global mutexes. A worker can exit
+and a lease can expire after inspection. The dispatch target stays bound to
+the original immutable lease in either race.
+
+The journal contains the exact lease and opaque execution and operation
+references. Store it on a local filesystem supporting file and directory
+synchronization and advisory locks. The parent directory must be owner-only
+and the journal must be a regular owner-only file. Keep the same journal
+during recovery. A torn or unreadable journal blocks startup. An intent
+without an acknowledgement, or a recorded uncertain outcome, requires manual
+comparison with trusted OpenBao and database evidence. Retain the original
+record and document reconciliation separately. Recovery never resends the
+recorded request. A local journal cannot guarantee exactly-once remote
+execution.
+
+An OpenBao acknowledgement and a fresh PostgreSQL authentication check are
+separate audit stages. Existing database sessions can outlive revocation.
+
+
+Milestone 6B was verified in one explicitly authorized Docker Desktop cgroup v2
+lab scenario. Trust includes the kernel, Docker daemon, privileged Tetragon
+agent, controller, and local OpenBao and PostgreSQL services. Coverage checks
+can withhold dispatch after detected gaps. Silent upstream loss can still
+limit what the controller sees. Journal recovery is manual and retaining the
+journal is part of the laboratory procedure.

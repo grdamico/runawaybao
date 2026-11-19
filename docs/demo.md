@@ -3,10 +3,9 @@
 [Back to the project overview](../README.md)
 
 The demonstrations cover credential isolation, runtime correlation, dry-run policy
-evaluation, and containerized database execution. The same process identity chain
-is relevant to future responses, but **Tetragon does not currently trigger
-credential revocation**. The separate policy mode adds dry-run allowlist findings; no security enforcement
-is performed.
+evaluation, and containerized database execution. These wrapper modes preserve
+their original behavior. The separate, terminal-confirmed 6B workflow
+demonstrates controlled revocation following a strongly verified policy finding.
 
 ## Prepare the disposable lab
 
@@ -150,3 +149,14 @@ execution-event delays and natural lease expiry, including failure-test leases.
 Services and the local worker image remain; temporary owned workers/networks and
 bootstrap mounts/policies are removed. The existing `all` mode remains credentials
 plus correlation only; it does not silently add the new suite.
+
+
+## Controlled enforcement demonstration
+
+Use the [6B runbook](testing.md#milestone-6b-local-enforcement) in an active WSL
+terminal to confirm the exact disposable target and run. In the verified
+scenario, the controller submitted one exact-lease request for B after a
+suspicious helper execution. OpenBao acknowledged the request. PostgreSQL then
+rejected a fresh login with B’s original credentials and accepted A’s login
+and fixed read. Keep the private journal and terminal credentials out of any
+recording. Run the default container database test separately for dry-run.

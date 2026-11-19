@@ -70,7 +70,7 @@ type scannedStream struct {
 	io.Closer
 }
 
-func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob.Manager, port uint16, identity bool) {
+func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob.Manager, port uint16, identity bool, live *liveEnforcement) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
@@ -139,6 +139,7 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 	unknownSeen := false
 	diagnostics := map[string]int{}
 	var helperAge time.Duration
+	var enforcementOutcome string
 	resolved := make(chan struct{})
 	go func() {
 		defer close(resolved)
@@ -171,7 +172,14 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 					t.Error("audit write failed")
 					return
 				}
+				var outcome string
+				if live != nil && d.Outcome == executionpolicy.Suspicious && r.JobID == "B" {
+					outcome = executor.Consider(ctx, live.controller, n, r, d)
+				}
 				mu.Lock()
+				if outcome != "" && outcome != "ineligible" {
+					enforcementOutcome = outcome
+				}
 				category := "other"
 				switch e.Process.Binary {
 				case "/runawaybao-db-worker":
@@ -338,6 +346,9 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 			a, b := namespacePairs["A"], namespacePairs["B"]
 			complete = complete && strong["A"] && strong["B"] && strongHelper && a[0] != b[0] && a[1] != b[1]
 		}
+		if live != nil {
+			complete = complete && enforcementOutcome == "revocation_acknowledged"
+		}
 		bad := wrong
 		mu.Unlock()
 		if bad {
@@ -381,14 +392,25 @@ func runContainerDatabase(t *testing.T, capture *capturingIssuer, m *databasejob
 		t.Fatal("observation gap lost")
 	}
 	t.Log("PASS: unknown events untargeted; stream interruption/reconnection retains visible gap generation")
-	failureChecks(t, ctx, docker, pgID, image, m, corr, adapter)
-	for _, id := range []string{"A", "B"} {
-		if executor.Read(ctx, id) != nil {
-			t.Fatal("post-policy container read failed")
+	if live == nil {
+		failureChecks(t, ctx, docker, pgID, image, m, corr, adapter)
+		for _, id := range []string{"A", "B"} {
+			if executor.Read(ctx, id) != nil {
+				t.Fatal("post-policy container read failed")
+			}
 		}
+		verifyOrigin()
+		t.Log("PASS: both workers reauthenticated and read after evaluation; no enforcement")
+	} else {
+		// Check fresh password authentication using the original credentials.
+		success := live.verify(ctx, port, a, b, ca, cb)
+		live.controller.Verification(success)
+		if !success {
+			t.Fatal("exact acknowledgement and database A/B verification did not agree")
+		}
+		live.checkAudit(t, capture)
+		t.Log("PASS: exact B lease acknowledged, B fresh authentication rejected, A fresh authentication and read succeeded")
 	}
-	verifyOrigin()
-	t.Log("PASS: both workers reauthenticated and read after evaluation; no enforcement")
 	for _, id := range []string{"A", "B"} {
 		r, _ := docker.Lookup(id)
 		if workload.CheckRedaction(ctx, r.ContainerID, []string{ca.Username, ca.Password, cb.Username, cb.Password, os.Getenv("RUNAWAYBAO_DATABASE_ROOT_TOKEN"), os.Getenv("RUNAWAYBAO_DATABASE_ADMIN_PASSWORD"), os.Getenv("RUNAWAYBAO_DATABASE_MANAGER_PASSWORD")}) != nil {

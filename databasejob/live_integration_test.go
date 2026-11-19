@@ -3,22 +3,26 @@
 package databasejob_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/grdamico/runawaybao/databasejob"
+	"github.com/grdamico/runawaybao/enforcement"
 	"github.com/grdamico/runawaybao/jobrunner"
 	"github.com/grdamico/runawaybao/openbao"
 	"github.com/jackc/pgx/v5"
@@ -81,7 +85,21 @@ func TestLiveWorkloadIdentity(t *testing.T) {
 	}
 	runLive(t, true, true, true, true)
 }
+func TestLiveControlledEnforcement(t *testing.T) {
+	if os.Getenv("RUNAWAYBAO_ENFORCEMENT_INTEGRATION") != "1" || os.Getenv("GITHUB_ACTIONS") != "" {
+		t.Skip("explicit local enforcement workflow required")
+	}
+	path := os.Getenv("RUNAWAYBAO_ENFORCEMENT_JOURNAL")
+	if path == "" {
+		t.Fatal("enforcement journal path required")
+	}
+	runLiveScenario(t, true, true, true, true, path)
+}
 func runLive(t *testing.T, observe, policy, container, identity bool) {
+	runLiveScenario(t, observe, policy, container, identity, "")
+}
+
+func runLiveScenario(t *testing.T, observe, policy, container, identity bool, journalPath string) {
 	if !observe && os.Getenv("RUNAWAYBAO_DATABASE_INTEGRATION") != "1" {
 		t.Skip("explicit live database opt-in required")
 	}
@@ -138,6 +156,15 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 	}
 	mount := "rbd-" + hex.EncodeToString(suffix)
 	role := "reader"
+	var run, target, confirmation string
+	if journalPath != "" {
+		run, err = enforcement.NewRun()
+		if err != nil {
+			t.Fatal("cannot establish disposable run")
+		}
+		target = "runawaybao " + address + " " + mount + "/creds/" + role
+		confirmation = confirmEnforcement(t, target+" "+run)
+	}
 	issuerPolicy := mount + "-issue"
 	revokerPolicy := mount + "-revoke"
 	// Cleanup registered before operations so partially failed bootstrap is covered.
@@ -164,7 +191,7 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 		issuerPolicy:  `path "` + mount + `/creds/reader" { capabilities = ["read"] }`,
 		revokerPolicy: `path "sys/leases/revoke/` + mount + `/creds/reader/*" { capabilities = ["update"] allowed_parameters = { "sync" = [true] } }`,
 	}
-	if observe {
+	if observe && journalPath == "" {
 		delete(policies, revokerPolicy)
 	}
 	for name, policy := range policies {
@@ -200,7 +227,7 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 	}
 	issueToken := createToken(issuerPolicy)
 	revokeToken := ""
-	if !observe {
+	if !observe || journalPath != "" {
 		revokeToken = createToken(revokerPolicy)
 	}
 	issuer, e := openbao.NewDatabaseIssuer(openbao.Config{Address: address, Token: issueToken}, mount, role)
@@ -214,7 +241,33 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 			t.Fatal("revoker setup failed")
 		}
 	}
-	capture := &capturingIssuer{issuer: issuer, credentials: make(map[string]openbao.DatabaseCredentials), redactionValues: []string{root, issueToken, password, os.Getenv("RUNAWAYBAO_DATABASE_ADMIN_PASSWORD")}}
+	var live *liveEnforcement
+	if journalPath != "" {
+		restricted, err := openbao.NewLeaseRevoker(openbao.Config{Address: address, Token: revokeToken}, mount, role)
+		if err != nil {
+			t.Fatal("restricted revoker setup failed")
+		}
+		live = &liveEnforcement{revoker: restricted}
+		var output auditBuffer
+		live.audit = &output
+		controller, err := enforcement.NewLocal(run, target, confirmation, journalPath, live, func(record enforcement.Record) {
+			if json.NewEncoder(&output).Encode(record) != nil {
+				t.Error("enforcement audit write failed")
+			} else {
+				t.Logf("enforcement %s %s", record.Stage, record.Reason)
+			}
+		})
+		if err != nil {
+			t.Fatal("enforcement authorization or journal unavailable")
+		}
+		t.Cleanup(func() {
+			if controller.Close() != nil {
+				t.Error("enforcement journal close failed")
+			}
+		})
+		live.controller = controller
+	}
+	capture := &capturingIssuer{issuer: issuer, credentials: make(map[string]openbao.DatabaseCredentials), redactionValues: []string{root, issueToken, revokeToken, password, os.Getenv("RUNAWAYBAO_DATABASE_ADMIN_PASSWORD")}}
 	pg, e := databasejob.NewPostgreSQL("127.0.0.1", uint16(port))
 	if e != nil {
 		t.Fatal("database client setup failed")
@@ -231,7 +284,7 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 			if e != nil {
 				t.Fatal("workload manager setup failed")
 			}
-			runContainerDatabase(t, capture, manager, uint16(port), identity)
+			runContainerDatabase(t, capture, manager, uint16(port), identity, live)
 		} else {
 			runObservation(t, capture, pg, manager, policy)
 		}
@@ -355,4 +408,34 @@ func runLive(t *testing.T, observe, policy, container, identity bool) {
 		t.Fatal("expired lease cleanup unconfirmed")
 	}
 	t.Log("PASS: expired credentials reject authentication and exact cleanup is acknowledged")
+}
+
+func confirmEnforcement(t *testing.T, expected string) string {
+	t.Helper()
+	terminal, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal("interactive terminal confirmation required")
+	}
+	defer terminal.Close()
+	fmt.Fprintf(terminal, "Confirm one exact-lease enforcement run for Job B in the disposable lab. Type this line verbatim to proceed.\n%s\n> ", expected)
+	answer := make(chan string, 1)
+	go func() {
+		line, err := bufio.NewReader(io.LimitReader(terminal, 512)).ReadString('\n')
+		if err != nil {
+			answer <- ""
+			return
+		}
+		answer <- strings.TrimRight(line, "\r\n")
+	}()
+	timer := time.NewTimer(2 * time.Minute)
+	defer timer.Stop()
+	select {
+	case line := <-answer:
+		if line != expected {
+			t.Fatal("enforcement authorization denied")
+		}
+	case <-timer.C:
+		t.Fatal("enforcement confirmation expired before setup")
+	}
+	return expected
 }

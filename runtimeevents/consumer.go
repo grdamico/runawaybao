@@ -23,6 +23,7 @@ type Coverage struct {
 }
 
 type Notice struct {
+	origin     *Consumer
 	Coverage   Coverage
 	Event      *Event
 	Gap        *Gap
@@ -85,7 +86,7 @@ func (c *Consumer) emit(e Event) {
 	generation := c.stats.Gaps
 	c.mu.Unlock()
 	select {
-	case c.Notices <- Notice{Event: &e, Generation: generation, Coverage: snapshot}:
+	case c.Notices <- Notice{origin: c, Event: &e, Generation: generation, Coverage: snapshot}:
 	default:
 		c.mu.Lock()
 		c.stats.Dropped++
@@ -222,6 +223,11 @@ func (c *Consumer) Coverage() Coverage {
 		status = "observing"
 	}
 	return Coverage{Status: status, Generation: c.stats.Gaps}
+}
+
+// OwnsNotice identifies an exec delivered by this controller's consumer.
+func (c *Consumer) OwnsNotice(n Notice) bool {
+	return n.origin == c && n.Event != nil
 }
 
 // EffectiveCoverage combines the event's frozen snapshot with current counters.

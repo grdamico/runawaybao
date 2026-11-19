@@ -400,3 +400,36 @@ for both database workers and for B's short-lived helper. Both workers
 reauthenticated afterward, and the test removed its owned resources. The
 initial 30-second freshness bound withheld strong assurance for delayed helper
 events. The verified run used the documented 45-second bound.
+
+## Milestone 6B local enforcement
+
+Run the destructive test only in the disposable loopback laboratory. Use a
+private, persistent local directory to retain the operation journal.
+
+```bash
+install -d -m 700 "$HOME/.local/state/runawaybao"
+./scripts/test-container-database.sh enforce "$HOME/.local/state/runawaybao/enforcement.jsonl"
+```
+
+Run it directly from an active WSL terminal. Service checks and compilation run
+before the prompt. The test prints a fresh run reference and the exact
+Compose project, OpenBao origin, and dedicated mount and role. Type the line
+verbatim into that terminal within two minutes to authorize one run for Job B.
+An expired prompt requires a fresh invocation. Bootstrap provisions a separate
+restricted revoker only after confirmation. The harness independently counts
+exact revocation dispatches and verifies B's original password is rejected
+before expiry while A authenticates and reads on a fresh connection.
+The default `./scripts/test-container-database.sh` runs the dry-run control.
+GitHub Actions compiles the integration tests without executing the live
+enforcement workflow.
+
+
+### Live acceptance evidence
+
+The operator ran `TestLiveControlledEnforcement` in WSL and reported PASS.
+The run verified strong worker and helper attribution, B’s suspicious finding,
+one acknowledged exact-lease operation, B’s failed fresh authentication before
+expiry, and A’s successful fresh authentication and read. Redaction, owned
+resource cleanup, and natural expiry of the remaining observation leases also
+passed. Publication review confirmed the protected journal held one authorized,
+dispatched and acknowledged operation with no unresolved entries.

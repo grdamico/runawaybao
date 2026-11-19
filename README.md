@@ -4,14 +4,15 @@
 
 RunawayBao is an experimental Go security prototype combining OpenBao, PostgreSQL,
 Docker, and Tetragon's eBPF observability. It demonstrates per-job database
-credentials, selective lease revocation, read-only runtime event correlation, and
-deterministic execution-policy evaluation in dry-run mode.
+credentials, read-only runtime correlation, deterministic policy evaluation, and
+explicitly authorized exact-lease enforcement in a disposable local lab.
 
 Secrets management controls access; runtime monitoring observes behavior. Connecting
 them safely requires knowing **which workload owns which credential lease**. An
 incorrect attribution could revoke an unrelated job's access. RunawayBao establishes
-that mapping before introducing automated security responses. Policies can now produce audit-only
-findings; no response is executed.
+that mapping before any enforcement action. The default workflow records policy
+findings in dry-run mode. A separate local workflow requires exact-target operator
+confirmation and fresh checks before it can revoke the verified workload’s lease.
 
 ## Current architecture
 
@@ -27,7 +28,10 @@ flowchart TB
         Policy["Immutable exact-path policy: dry-run only"]
         Audit["Sanitized audit records"]
     end
-    Bao["OpenBao: restricted issuer"]
+    Operator["Local operator: confirms target and run"]
+    Guard["Opt-in controller: reserves and revalidates"]
+    Journal["Protected dispatch journal"]
+    Bao["OpenBao: separate restricted issuer and revoker"]
     PG["PostgreSQL: attached to both owned networks"]
     subgraph NetA["Owned internal isolated network A"]
         A["Job A: startup gate and Go database worker"]
@@ -57,14 +61,20 @@ flowchart TB
     Registry -->|"Read-only metadata"| Observer
     Observer --> Policy
     Policy --> Audit
+    Operator --> Guard
+    Observer -->|"Accepted observation and verified identity"| Guard
+    Policy -->|"Pure decision"| Guard
+    Registry -->|"Reserved exact lease"| Guard
+    Guard -->|"Durable intent before dispatch"| Journal
+    Guard -->|"One synchronous exact-lease request"| Bao
 ```
 
 **Milestone 5 executes the database reads inside the monitored containers.**
 A bootstrap gate delays the worker until immutable job/container/lease and policy
 bindings are established. Credentials travel only over attached, non-TTY stdin:
 strict JSON frames are capped at 16 KiB, exchanges have a 10-second deadline,
-and uncertain delivery is never automatically resent. The new
-coordinator has no revoker, and the observer and evaluator remain read-only.
+and uncertain delivery is never automatically resent. The observer and evaluator
+remain read-only. The opt-in controller uses a separate restricted revoker.
 The earlier controller-query demonstrations remain available as regression tests.
 See the [full architecture](docs/architecture.md) and
 [security model](docs/security-model.md).
@@ -196,8 +206,8 @@ history; parent lineage was incomplete in this environment. Revocation is verifi
 against new authentication, not termination of existing PostgreSQL sessions.
 Docker/controller privileges and privileged Tetragon monitoring remain trust boundaries.
 
-There is no general threat detection or event-driven revocation. Policy violations
-are dry-run findings, not proof of malicious intent.
+The local enforcement workflow responds to verified violations of an explicit
+allowlist. An allowlist violation does not establish malicious intent.
 The new live path requires Docker bridge `isolated` gateway mode. Network probes
 cover selected endpoints, not every host service or DNS exfiltration path. Read the
 [security model and full limitations](docs/security-model.md) before extending the lab.
@@ -216,6 +226,15 @@ result and grants no permission to act on a credential.
 See [runtime correlation and identity assurance](docs/policy.md#workload-identity-assurance)
 for the distinction and its trust assumptions.
 
+## Controlled enforcement in the local lab
+
+The operator-confirmed 6B run verified Job B’s identity and suspicious helper,
+and OpenBao acknowledged one synchronous request for B’s exact lease. Fresh
+PostgreSQL authentication then rejected B’s original credentials before expiry,
+while A authenticated and completed the fixed read. Existing sessions can
+outlive revocation. Follow the [local enforcement runbook](docs/testing.md#milestone-6b-local-enforcement)
+from an active WSL terminal.
+
 ## Roadmap
 
 | Milestone | Status |
@@ -226,8 +245,8 @@ for the distinction and its trust assumptions.
 | 4 — Explicit policy evaluation and dry-run decisions | Completed |
 | 5 — Containerized database workloads, dry-run only | Completed |
 | 6A — Strong workload identity validation | Completed, verified in the local Docker Desktop lab |
-| 6B — Controlled enforcement | Planned |
-| Durable state, recovery, audit records, and stronger operational controls | Future |
+| 6B — Controlled enforcement | Completed, live-verified in the explicitly authorized local lab |
+| Broader durable state, automated recovery, and operational controls | Future |
 
 ## Documentation
 

@@ -318,3 +318,42 @@ func assessIdentity(b binding, e Event, info workload.Container, late bool, cove
 	}
 	return VerifiedIdentity, "namespace_binding_matched"
 }
+
+// RecheckIdentity validates a previously resolved event against fresh inventory
+// and current coverage without adding a second deduplication entry.
+func (c *Correlator) RecheckIdentity(e Event, resolved Result, inventory []workload.Container, coverage Coverage) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if resolved.Assurance != VerifiedIdentity || resolved.Status != "correlated" ||
+		resolved.ExecID != e.Process.ExecID || e.Process.Docker == "" ||
+		!strings.HasPrefix(resolved.ContainerID, e.Process.Docker) ||
+		(e.FullID != "" && normalizedFull(e.FullID) != resolved.ContainerID) {
+		return false
+	}
+	b, ok := c.bindings[resolved.ContainerID]
+	if !ok || b.job != resolved.JobID || b.invalid || !b.finished.IsZero() ||
+		e.Process.Start.Before(b.started) || e.Process.Start.Before(b.latest) ||
+		c.seen[e.Node+"\x00exec\x00"+e.Process.ExecID].IsZero() {
+		return false
+	}
+	for id := range c.bindings {
+		if id != resolved.ContainerID && strings.HasPrefix(id, e.Process.Docker) {
+			return false
+		}
+	}
+	var info workload.Container
+	for _, candidate := range inventory {
+		if !workload.IDPattern.MatchString(candidate.ID) {
+			return false
+		}
+		if !strings.HasPrefix(candidate.ID, e.Process.Docker) {
+			continue
+		}
+		if candidate.ID != resolved.ContainerID || info.ID != "" {
+			return false
+		}
+		info = candidate
+	}
+	assurance, _ := assessIdentity(b, e, info, false, coverage, time.Now())
+	return assurance == VerifiedIdentity
+}

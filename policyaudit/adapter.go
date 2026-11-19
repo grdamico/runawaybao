@@ -76,6 +76,21 @@ func coverage(c runtimeevents.Coverage) executionpolicy.Coverage {
 	return executionpolicy.Coverage{Status: c.Status, Generation: c.Generation, HadGaps: c.Generation > 0}
 }
 
+// PolicyDigest reports the digest of a specific trusted immutable binding.
+func (a *Adapter) PolicyDigest(job, workload, id, version string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	b, ok := a.bindings[workload]
+	if !ok || b.job != job {
+		return ""
+	}
+	policyID, policyVersion := b.policy.Identity()
+	if policyID != id || policyVersion != version {
+		return ""
+	}
+	return b.policy.Digest()
+}
+
 // Evaluate must receive the original event and result from the trusted correlator,
 // never caller-supplied job IDs. Result matching is checked again at this boundary.
 func (a *Adapter) Evaluate(e runtimeevents.Event, r runtimeevents.Result, c runtimeevents.Coverage) executionpolicy.Decision {

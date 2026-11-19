@@ -3,6 +3,7 @@
 set +x
 source "$(dirname "$0")/common.sh"
 test_name=TestLiveContainerDatabase
+test_timeout=5m
 case "${1:-}" in
   "") ;;
   identity)
@@ -13,7 +14,17 @@ case "${1:-}" in
     export RUNAWAYBAO_IDENTITY_INTEGRATION=1
     test_name=TestLiveWorkloadIdentity
     ;;
-  *) echo "Usage: $0 [identity]" >&2; exit 1 ;;
+  enforce)
+    if [[ -n "${GITHUB_ACTIONS:-}" || ! -t 0 || $# != 2 || "$2" != /* ]]; then
+      echo "Enforcement requires a local terminal and an absolute protected journal path." >&2
+      exit 1
+    fi
+    export RUNAWAYBAO_ENFORCEMENT_INTEGRATION=1
+    export RUNAWAYBAO_ENFORCEMENT_JOURNAL="$2"
+    test_name=TestLiveControlledEnforcement
+    test_timeout=8m
+    ;;
+  *) echo "Usage: $0 [identity | enforce JOURNAL]" >&2; exit 1 ;;
 esac
 dc up -d openbao postgres tetragon
 for ((attempt=1; attempt<=60; attempt++)); do
@@ -28,4 +39,4 @@ export RUNAWAYBAO_DATABASE_ROOT_TOKEN="$BAO_TOKEN"
 export RUNAWAYBAO_DATABASE_PORT="${POSTGRES_PORT:-15432}"
 export RUNAWAYBAO_DATABASE_MANAGER_PASSWORD="${DB_MANAGER_PASSWORD:-runawaybao-manager-dev-only}"
 export RUNAWAYBAO_DATABASE_ADMIN_PASSWORD="${POSTGRES_PASSWORD:-runawaybao-admin-dev-only}"
-go test -tags=integration ./databasejob -run "^${test_name}$" -count=1 -timeout 5m -v
+go test -tags=integration ./databasejob -run "^${test_name}$" -count=1 -timeout "$test_timeout" -v

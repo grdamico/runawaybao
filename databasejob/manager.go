@@ -214,6 +214,9 @@ func (m *Manager) RevokeJob(ctx context.Context, id string) error {
 	if !validContext(ctx) {
 		return ErrConfiguration
 	}
+	if m.revoker == nil {
+		return ErrRevoke
+	}
 	e, err := m.acquire(id)
 	if err != nil {
 		return err
@@ -221,6 +224,44 @@ func (m *Manager) RevokeJob(ctx context.Context, id string) error {
 	defer m.release(e)
 	return m.revoke(ctx, e)
 }
+
+// WithWorkloadLease reserves the exact private issuance record for a running
+// workload. Workload managers have no legacy revocation client of their own.
+func (m *Manager) WithWorkloadLease(job, workload string, use func(Record)) bool {
+	if use == nil {
+		return false
+	}
+	e, err := m.acquire(job)
+	if err != nil {
+		return false
+	}
+	defer m.release(e)
+	m.mu.Lock()
+	record := e.record
+	valid := !m.closed && m.revoker == nil && record.WorkloadID == workload &&
+		record.LeaseID != "" && record.State == Active && record.Delivery == "delivered"
+	for _, other := range m.jobs {
+		if other != e && other.record.LeaseID == record.LeaseID {
+			valid = false
+			break
+		}
+	}
+	m.mu.Unlock()
+	if valid {
+		use(record)
+	}
+	return valid
+}
+
+// WorkloadLeaseCurrent is a final snapshot while WithWorkloadLease holds the
+// entry reservation. Pending manager shutdown invalidates dispatch.
+func (m *Manager) WorkloadLeaseCurrent(record Record) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.jobs[record.JobID]
+	return !m.closed && e != nil && e.busy && e.record == record
+}
+
 func (m *Manager) Lookup(id string) (Record, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -321,13 +362,14 @@ func (m *Manager) Prepare(ctx context.Context, id string) error {
 	m.jobs[id] = e
 	m.mu.Unlock()
 	defer m.release(e)
+	issued := time.Now()
 	credentials, err := m.issuer.Issue(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e.credentials = credentials
 	e.record.LeaseID = credentials.LeaseID
 	e.record.TTL = credentials.TTL
-	e.record.IssuedAt = time.Now()
+	e.record.IssuedAt = issued
 	e.record.Delivery = "not_delivered"
 	if err != nil || ctx.Err() != nil || credentials.LeaseID == "" || credentials.Username == "" || credentials.Password == "" || credentials.TTL <= 0 {
 		e.record.State = IssuanceFailed
